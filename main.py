@@ -443,111 +443,55 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
-    """Parse PDF with ordered fallback chain:
-    1. pdfplumber  — fast native extraction; proceed if quality is good
-    2. Docling     — high-quality layout-aware engine (if pdfplumber score low)
-    3. Marker      — handles difficult/scanned PDFs → Markdown output
-    4. tesseract   — last resort OCR via pytesseract
+    """PDF pipeline:
+    - PDF nativo (texto embutido): renderiza TODAS as páginas em imagem (300 DPI) antes de extrair.
+    - PDF escaneado: segue direto para OCR.
+    Em ambos os casos, o texto final vem do pipeline OCR.
     """
     filename = path.name
-    text = ""
-    method = ""
-    pages = 0
+    is_native = _pdf_has_embedded_text(path)
 
-    # ── 1) pdfplumber — rápido, extração nativa ──────────────────────────────
     try:
-        import pdfplumber
-        with pdfplumber.open(str(path)) as pdf:
-            pages = len(pdf.pages)
-            parts = [(pg.extract_text() or "") for pg in pdf.pages]
-            text = "\n".join(parts).strip()
-            if text:
-                method = "pdfplumber"
+        dpi = 300 if is_native else 250
+        ocr_text, pages = _pdf_ocr_tesseract(path, use_easyocr, dpi=dpi)
+        method = "easyocr" if use_easyocr else "tesseract"
+        type_detected = "pdf_native" if is_native else "pdf_scanned"
+        return _make_result(filename, type_detected, method, pages or 1, 0.0, ocr_text)
     except Exception as e:
-        logger.debug("pdfplumber falhou em %s: %s", filename, e)
+        logger.debug("OCR em PDF falhou em %s: %s", filename, e)
+        return _make_result(filename, "pdf", "failed", 0, 0.0, "", error=str(e))
 
-    text = _normalize_text(text)
-    quality = _quality_score(text, pages)
-    chars_per_page = (len(text) / max(1, pages)) if text else 0
-    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW or chars_per_page < MIN_CHARS_PER_PAGE_NATIVE
 
-    # ── 2) Docling — engine principal de qualidade (se score do pdfplumber baixo) ──
-    if not text or native_is_weak or force_ocr:
+def _pdf_has_embedded_text(path: Path) -> bool:
+    try:
+        import fitz
+        doc = fitz.open(str(path))
         try:
-            from docling.document_converter import DocumentConverter  # type: ignore
-            converter = DocumentConverter()
-            result = converter.convert(str(path))
-            docling_text = result.document.export_to_text() if result and result.document else ""
-            docling_text = _normalize_text(docling_text)
-            if docling_text:
-                docling_pages = pages or 1
-                docling_quality = _quality_score(docling_text, docling_pages)
-                if force_ocr or docling_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                    text = docling_text
-                    pages = docling_pages
-                    quality = docling_quality
-                    method = "docling"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-        except ImportError:
-            logger.warning("docling não instalado — pulando etapa 2 do fallback para %s", filename)
-        except Exception as e:
-            logger.debug("docling falhou em %s: %s", filename, e)
-
-    # ── 3) Marker — fallback para PDFs difíceis → Markdown ───────────────────
-    if not text or native_is_weak:
-        try:
-            from marker.convert import convert_single_pdf  # type: ignore
-            from marker.models import load_all_models  # type: ignore
-            marker_models = load_all_models()
-            full_text_md, _doc_images, _metadata = convert_single_pdf(str(path), marker_models)
-            marker_text = _normalize_text(full_text_md or "")
-            if marker_text:
-                marker_pages = pages or 1
-                marker_quality = _quality_score(marker_text, marker_pages)
-                if force_ocr or marker_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                    text = marker_text
-                    pages = marker_pages
-                    quality = marker_quality
-                    method = "marker"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-        except ImportError:
-            logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
-        except Exception as e:
-            logger.debug("marker falhou em %s: %s", filename, e)
-
-    # ── 4) Tesseract — último recurso via pytesseract ─────────────────────────
-    if force_ocr or not text or native_is_weak:
-        try:
-            ocr_text, pages_ocr = _pdf_ocr_tesseract(path, use_easyocr)
-            ocr_text = _normalize_text(ocr_text)
-            ocr_pages = pages_ocr or pages or 1
-            ocr_quality = _quality_score(ocr_text, ocr_pages)
-            if force_ocr or ocr_quality >= quality or quality < REPROCESS_IF_SCORE_BELOW:
-                text = ocr_text
-                pages = ocr_pages
-                quality = ocr_quality
-                method = "easyocr" if use_easyocr else "tesseract"
-        except Exception as e:
-            logger.debug("tesseract OCR falhou em %s: %s", filename, e)
-
-    type_detected = "pdf_native" if method in ("pdfplumber", "docling", "marker") else "pdf_scanned"
-    return _make_result(filename, type_detected, method or "failed", pages, quality, text)
+            for i in range(doc.page_count):
+                txt = (doc.load_page(i).get_text("text") or "").strip()
+                if len(txt) >= 30:
+                    return True
+            return False
+        finally:
+            doc.close()
+    except Exception:
+        return False
 
 
-def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
-    """Render PDF pages as images and OCR them."""
+def _pdf_ocr_tesseract(path: Path, use_easyocr: bool, dpi: int = 300) -> tuple:
+    """Render PDF pages as images e passa todas pelo pipeline OCR."""
     import pytesseract
     from PIL import Image
     try:
         from pdf2image import convert_from_path
-        images = convert_from_path(str(path), dpi=200)
+        images = convert_from_path(str(path), dpi=dpi)
     except Exception:
         # fallback: use pymupdf to render
         import fitz
         doc = fitz.open(str(path))
         images = []
         for i in range(doc.page_count):
-            pix = doc.load_page(i).get_pixmap(dpi=200)
+            pix = doc.load_page(i).get_pixmap(dpi=dpi)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             images.append(img)
         doc.close()
