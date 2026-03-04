@@ -89,6 +89,19 @@ class ParseResponse(BaseModel):
     processing_time_s: float = 0.0
 
 
+class EnrichmentResult(BaseModel):
+    tender_id: str
+    chunks_total: int
+    chunks_ok: int
+    processing_time_s: float
+    resumo_ia: Optional[str] = None
+    regras_licitacao: Optional[dict] = None
+    itens: Optional[list] = None
+    fornecedores_sugeridos: Optional[dict] = None
+    raw_chunks: Optional[list] = None
+    created_at: str
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -159,6 +172,38 @@ def list_storage(tender_id: str):
         "files": sorted(files),
         "count": len(files),
     }
+
+
+@app.post("/storage/{tender_id}/enrichment")
+def save_enrichment(tender_id: str, payload: EnrichmentResult):
+    if payload.tender_id != tender_id:
+        raise HTTPException(status_code=400, detail="tender_id mismatch between path and payload")
+
+    target_dir = STORAGE_ROOT / tender_id
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / "enrichment.json"
+    target_file.write_text(
+        json.dumps(payload.model_dump(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return {
+        "ok": True,
+        "tender_id": tender_id,
+        "saved_path": str(target_file),
+    }
+
+
+@app.get("/storage/{tender_id}/enrichment")
+def get_enrichment(tender_id: str):
+    target_file = STORAGE_ROOT / tender_id / "enrichment.json"
+    if not target_file.exists() or not target_file.is_file():
+        raise HTTPException(status_code=404, detail="Enrichment not found for tender")
+
+    try:
+        return json.loads(target_file.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read enrichment file: {exc}")
 
 
 @app.delete("/storage/{tender_id}")
