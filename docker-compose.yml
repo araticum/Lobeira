@@ -1,6 +1,6 @@
 services:
   parser:
-    build: .
+    image: ghcr.io/araticum/parser-monstro:latest
     ports:
       - "7000:7000"
     volumes:
