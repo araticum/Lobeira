@@ -9,4 +9,5 @@ services:
       - ENABLE_EASYOCR=false
       - MAX_WORKERS=2
       - LOG_LEVEL=INFO
+      - PARSER_MODE=precision_first
     restart: unless-stopped
