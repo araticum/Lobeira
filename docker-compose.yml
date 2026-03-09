@@ -23,14 +23,9 @@ services:
       - HSA_OVERRIDE_GFX_VERSION=11.0.0
     # --- AMD ROCm GPU passthrough (Docker Desktop + WSL2) ---
     # No WSL2, o device de GPU é /dev/dxg (interface DirectX do Windows → WSL2).
-    # /dev/kfd (Linux nativo) NÃO existe no WSL2 — não usar.
-    # /dev/dri expõe o renderizador DRI (renderD128, card0, etc.)
+    # /dev/kfd e /dev/dri NÃO existem no WSL2 — não usar.
     devices:
       - /dev/dxg:/dev/dxg
-      - /dev/dri:/dev/dri
-    group_add:
-      - video
-      - render
     # ipc: host permite memória compartilhada entre processos ROCm
     ipc: host
     restart: unless-stopped
