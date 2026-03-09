@@ -635,7 +635,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 logs.append(f"docling: falhou ({e})")
 
     # ── 3) Marker — fallback para PDFs difíceis → Markdown ───────────────────
-    if not text or native_is_weak:
+    if not text or native_is_weak or force_ocr:
         try:
             from marker.convert import convert_single_pdf  # type: ignore
             from marker.models import load_all_models  # type: ignore
@@ -663,22 +663,25 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logs.append(f"marker: falhou ({e})")
 
     # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
-    if not text or native_is_weak:
+    if not text or native_is_weak or force_ocr:
         try:
             text_ocr, pages_ocr, ocr_engine = _pdf_ocr_tesseract(path, use_easyocr)
             ocr_text = _normalize_text(text_ocr)
             if ocr_text:
-                ocr_quality = _quality_score(ocr_text, pages_ocr or max(1, pages))
-                if ocr_quality > quality:
+                ocr_pages = pages_ocr or max(1, pages)
+                ocr_quality = _quality_score(ocr_text, ocr_pages)
+                # Accept OCR if: no text yet, forced, or actually better quality.
+                # Use >= to handle the case where both scores round to 0.0 (sparse/long PDFs).
+                if force_ocr or not text or ocr_quality >= quality:
                     text = ocr_text
-                    pages = pages_ocr or pages
+                    pages = ocr_pages
                     quality = ocr_quality
                     method = "ocr"
                     logs.append(
                         f"ocr ({ocr_engine}): extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
                     )
                 else:
-                    logs.append(f"ocr ({ocr_engine}): não melhorou resultado (score {ocr_quality:.2f})")
+                    logs.append(f"ocr ({ocr_engine}): não melhorou resultado (score {ocr_quality:.2f} vs {quality:.2f})")
             else:
                 logs.append("ocr: resultado vazio")
         except Exception as e:
@@ -714,8 +717,8 @@ def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
             import easyocr
             import numpy as np
             easyocr_reader = easyocr.Reader(["pt", "en"])
-        except Exception:
-            pass  # fallback to tesseract below
+        except Exception as _ocr_init_err:
+            logger.warning("easyocr init falhou, usando tesseract: %s", _ocr_init_err)
 
     parts = []
     for img in images:
@@ -816,12 +819,15 @@ def _quality_score(text: str, pages: int) -> float:
 
 def _make_result(filename, type_detected, method, pages, quality, text, error=None, logs=None) -> Dict:
     normalized_text = _normalize_text(text)
-    quality = _quality_score(normalized_text, pages)
+    # Only recalculate quality if not already provided (pages=0 kills _quality_score).
+    # Callers that already computed quality should pass it explicitly.
+    if not quality and normalized_text and pages:
+        quality = _quality_score(normalized_text, pages)
     return {
         "filename": filename,
         "type_detected": type_detected,
         "method_used": method,
-        "pages": pages,
+        "pages": max(pages, 1) if normalized_text else pages,
         "quality_score": quality,
         "text": normalized_text,
         "error": error,
