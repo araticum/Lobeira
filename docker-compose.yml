@@ -10,4 +10,27 @@ services:
       - MAX_WORKERS=2
       - LOG_LEVEL=INFO
       - PARSER_MODE=precision_first
+      # --- AMD ROCm / GPU ---
+      # Seleciona a primeira GPU AMD visível
+      - ROCR_VISIBLE_DEVICES=0
+      # HSA_OVERRIDE_GFX_VERSION: necessário para GPUs que o ROCm não reconhece nativamente.
+      # Descubra o valor correto rodando `rocminfo` no WSL2 e veja o campo "gfx version".
+      # Exemplos comuns:
+      #   RX 6000 series (RDNA2, gfx1030): HSA_OVERRIDE_GFX_VERSION=10.3.0
+      #   RX 7000 series (RDNA3, gfx1100): HSA_OVERRIDE_GFX_VERSION=11.0.0
+      #   RX 9000 series (RDNA4, gfx1201): HSA_OVERRIDE_GFX_VERSION=12.0.1
+      # Descomente e ajuste conforme sua GPU:
+      # - HSA_OVERRIDE_GFX_VERSION=11.0.0
+    # --- AMD ROCm GPU passthrough (Docker Desktop + WSL2) ---
+    # No WSL2, o device de GPU é /dev/dxg (interface DirectX do Windows → WSL2).
+    # /dev/kfd (Linux nativo) NÃO existe no WSL2 — não usar.
+    # /dev/dri expõe o renderizador DRI (renderD128, card0, etc.)
+    devices:
+      - /dev/dxg:/dev/dxg
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    # ipc: host permite memória compartilhada entre processos ROCm
+    ipc: host
     restart: unless-stopped
