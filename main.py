@@ -666,6 +666,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     pages = marker_pages
                     quality = marker_quality
                     method = "marker"
+                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW  # reavalia após marker atualizar quality
                     logs.append(f"marker: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
                 else:
                     logs.append(f"marker: não melhorou resultado (score {marker_quality:.2f} vs {quality:.2f})")
