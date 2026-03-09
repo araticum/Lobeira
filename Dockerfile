@@ -29,11 +29,8 @@ RUN pip install --no-cache-dir -r requirements-heavy.txt || echo "WARNING: heavy
 RUN pip install --no-cache-dir "torch==2.7.0+rocm6.3" "torchvision==0.22.0+rocm6.3" --index-url https://download.pytorch.org/whl/rocm6.3
 
 
-# Opt-in EasyOCR (heavy, GPU-optional)
-ARG ENABLE_EASYOCR=false
-RUN if [ "$ENABLE_EASYOCR" = "true" ]; then \
-    pip install --no-cache-dir easyocr torch torchvision --index-url https://download.pytorch.org/whl/cpu; \
-    fi
+# EasyOCR — usa o torch ROCm já instalado acima (não reinstala torch)
+RUN pip install --no-cache-dir easyocr
 
 COPY main.py .
 COPY zip_recursive.py .
@@ -42,7 +39,6 @@ RUN mkdir -p /app/storage
 
 EXPOSE 7000
 
-ENV ENABLE_EASYOCR=false
 ENV MAX_WORKERS=2
 ENV LOG_LEVEL=INFO
 
