@@ -28,7 +28,9 @@ RUN pip install --no-cache-dir -r requirements-core.txt
 COPY requirements-heavy.txt .
 RUN pip install --no-cache-dir -r requirements-heavy.txt || echo "WARNING: heavy deps failed, continuing without them"
 # Install torch with ROCm support (AMD Radeon) instead of default CUDA
-RUN pip install --no-cache-dir "torch==2.7.0+rocm6.3" "torchvision==0.22.0+rocm6.3" --index-url https://download.pytorch.org/whl/rocm6.3
+RUN pip install --no-cache-dir \
+    torch-2.9.1+rocm7.2.0... \  
+# wheels oficiais AMD de repo.radeon.com
 
 # Marker (step 3 OCR) — instalado DEPOIS do torch ROCm para evitar conflito
 # --no-deps em marker-pdf: pula torch (ROCm já instalado acima, não disponível no PyPI padrão)
