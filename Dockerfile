@@ -30,6 +30,26 @@ RUN pip install --no-cache-dir -r requirements-heavy.txt || echo "WARNING: heavy
 # Install torch with ROCm support (AMD Radeon) instead of default CUDA
 RUN pip install --no-cache-dir "torch==2.7.0+rocm6.3" "torchvision==0.22.0+rocm6.3" --index-url https://download.pytorch.org/whl/rocm6.3
 
+# Marker (step 3 OCR) — instalado DEPOIS do torch ROCm para evitar conflito
+# --no-deps em marker-pdf: pula torch (ROCm já instalado acima, não disponível no PyPI padrão)
+# surya-ocr instalado sem --no-deps: pip vê torch>=2.7.0 já satisfeito pelo ROCm, não reinstala
+RUN pip install --no-cache-dir marker-pdf --no-deps && \
+    pip install --no-cache-dir \
+        "surya-ocr>=0.17.1,<0.18.0" \
+        "anthropic>=0.46.0,<0.47.0" \
+        "filetype>=1.2.0,<2.0.0" \
+        "ftfy>=6.1.1,<7.0.0" \
+        "google-genai>=1.0.0,<2.0.0" \
+        "markdown2>=2.5.2,<3.0.0" \
+        "markdownify>=1.1.0,<2.0.0" \
+        "openai>=1.65.2,<2.0.0" \
+        "pdftext>=0.6.3,<0.7.0" \
+        "pydantic-settings>=2.0.3,<3.0.0" \
+        "python-dotenv>=1.0.0,<2.0.0" \
+        "rapidfuzz>=3.8.1,<4.0.0" \
+        "scikit-learn>=1.6.1,<2.0.0" \
+        "transformers>=4.45.2,<5.0.0" \
+    || echo "WARNING: marker-pdf deps failed — Marker não estará disponível no step 3"
 
 # EasyOCR — usa o torch ROCm já instalado acima (não reinstala torch)
 RUN pip install --no-cache-dir easyocr

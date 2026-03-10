@@ -32,6 +32,11 @@ ENABLE_EASYOCR = os.getenv("ENABLE_EASYOCR", "false").lower() == "true"
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_first" else "2"))
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
 
+# Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
+# Deve ser definido ANTES da primeira importação de surya/marker
+MARKER_MODEL_DIR = str(STORAGE_ROOT / "marker_models")
+os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
+
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
 REPROCESS_IF_SCORE_BELOW = float(os.getenv("REPROCESS_IF_SCORE_BELOW", "0.72" if PARSER_MODE == "precision_first" else "0.55"))
@@ -40,6 +45,41 @@ CLEAN_OCR_NOISE = os.getenv("CLEAN_OCR_NOISE", "true").lower() == "true"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("parser-monstro")
+
+# ---------------------------------------------------------------------------
+# Marker global model cache (evita recarregar modelos a cada chamada)
+# ---------------------------------------------------------------------------
+_marker_models = None
+_marker_models_lock = None  # inicializado em _get_marker_models para evitar import no topo
+
+
+def _get_marker_models():
+    """Retorna (e inicializa se necessário) o dict de modelos Marker/Surya.
+
+    Thread-safe: múltiplos workers podem chamar em paralelo.
+    Os modelos ficam em memória entre requisições para evitar reload.
+    """
+    global _marker_models, _marker_models_lock
+    import threading
+
+    if _marker_models_lock is None:
+        _marker_models_lock = threading.Lock()
+
+    with _marker_models_lock:
+        if _marker_models is None:
+            from marker.models import create_model_dict  # type: ignore
+            _marker_models = create_model_dict()
+    return _marker_models
+
+
+def _preload_marker():
+    """Pré-carrega modelos Marker em background thread para evitar delay na primeira inferência."""
+    try:
+        logger.info("Pré-carregando modelos Marker/Surya (MODEL_CACHE_DIR=%s)...", MARKER_MODEL_DIR)
+        _get_marker_models()
+        logger.info("Modelos Marker carregados com sucesso.")
+    except Exception as e:
+        logger.warning("Falha ao pré-carregar Marker: %s", e)
 
 # ---------------------------------------------------------------------------
 # In-memory job store
@@ -160,6 +200,9 @@ async def startup():
         FORCE_OCR_IF_SCORE_BELOW,
         REPROCESS_IF_SCORE_BELOW,
     )
+    Path(MARKER_MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=_preload_marker, daemon=True, name="marker-preload").start()
+    logger.info("Thread de pré-carregamento Marker iniciada em background.")
     if ENABLE_EASYOCR:
         threading.Thread(target=_preload_easyocr, daemon=True, name="easyocr-preload").start()
         logger.info("Thread de pré-carregamento EasyOCR iniciada em background.")
@@ -670,13 +713,16 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 logger.warning("docling falhou em %s: %s", filename, e)
                 logs.append(f"docling: falhou ({e})")
 
-    # ── 3) Marker — fallback para PDFs difíceis → Markdown ───────────────────
+    # ── 3) Marker — fallback para PDFs difíceis → Markdown (API v1+) ─────────
+    # Usa PdfConverter + create_model_dict (marker-pdf >= 1.0.0)
     if not text or native_is_weak or force_ocr:
         try:
-            from marker.convert import convert_single_pdf  # type: ignore
-            from marker.models import load_all_models  # type: ignore
-            marker_models = load_all_models()
-            full_text_md, _doc_images, _metadata = convert_single_pdf(str(path), marker_models)
+            from marker.converters.pdf import PdfConverter  # type: ignore
+            from marker.output import text_from_rendered  # type: ignore
+            models = _get_marker_models()
+            converter = PdfConverter(artifact_dict=models)
+            rendered = converter(str(path))
+            full_text_md, _, _ = text_from_rendered(rendered)
             marker_text = _normalize_text(full_text_md or "")
             if marker_text:
                 marker_pages = pages or 1
@@ -686,7 +732,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                     pages = marker_pages
                     quality = marker_quality
                     method = "marker"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW  # reavalia após marker atualizar quality
+                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW  # reavalia após marker
                     logs.append(f"marker: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
                 else:
                     logs.append(f"marker: não melhorou resultado (score {marker_quality:.2f} vs {quality:.2f})")
@@ -696,7 +742,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
             logs.append("marker: não instalado — pulado")
         except Exception as e:
-            logger.debug("marker falhou em %s: %s", filename, e)
+            logger.warning("marker falhou em %s: %s", filename, e)
             logs.append(f"marker: falhou ({e})")
 
     # ── 4) OCR — fallback final para PDFs scaneados ───────────────────────────
