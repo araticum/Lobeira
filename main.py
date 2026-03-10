@@ -61,6 +61,7 @@ def _get_marker_models():
     """
     global _marker_models, _marker_models_lock
     import threading
+    import torch
 
     if _marker_models_lock is None:
         _marker_models_lock = threading.Lock()
@@ -68,14 +69,37 @@ def _get_marker_models():
     with _marker_models_lock:
         if _marker_models is None:
             from marker.models import create_model_dict  # type: ignore
-            _marker_models = create_model_dict()
+            # Determina device: respeita TORCH_DEVICE env var (já lido pelo Surya Settings),
+            # mas também passa explicitamente para garantir que todos os modelos usem o mesmo device.
+            # ROCm expõe-se como "cuda" via HIP — torch.cuda.is_available() retorna True com ROCm.
+            torch_device_env = os.environ.get("TORCH_DEVICE")
+            if torch_device_env:
+                device = torch_device_env
+            else:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(
+                "Inicializando Marker/Surya com device=%s "
+                "(torch.cuda.is_available=%s, torch.version.cuda=%s, TORCH_DEVICE_ENV=%s)",
+                device,
+                torch.cuda.is_available(),
+                getattr(torch.version, "cuda", "N/A"),
+                torch_device_env or "<não definido>",
+            )
+            _marker_models = create_model_dict(device=device)
     return _marker_models
 
 
 def _preload_marker():
     """Pré-carrega modelos Marker em background thread para evitar delay na primeira inferência."""
+    import torch
     try:
-        logger.info("Pré-carregando modelos Marker/Surya (MODEL_CACHE_DIR=%s)...", MARKER_MODEL_DIR)
+        logger.info(
+            "Pré-carregando modelos Marker/Surya (MODEL_CACHE_DIR=%s) | "
+            "torch.cuda.is_available()=%s | torch.version.cuda=%s",
+            MARKER_MODEL_DIR,
+            torch.cuda.is_available(),
+            getattr(torch.version, "cuda", "N/A"),
+        )
         _get_marker_models()
         logger.info("Modelos Marker carregados com sucesso.")
     except Exception as e:
