@@ -35,6 +35,12 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_firs
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
 JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 
+# ROCm/HIP segue a semântica de torch.cuda; usar device="cuda" é o caminho certo.
+# Preferimos defaults conservadores de alocador/workspace para reduzir fragmentação/OOM,
+# sem sobrescrever overrides explícitos de runtime/deploy.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 # Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
 # Deve ser definido ANTES da primeira importação de surya/marker
 MARKER_MODEL_DIR = str(STORAGE_ROOT / "marker_models")
@@ -54,6 +60,93 @@ logger = logging.getLogger("parser-monstro")
 # ---------------------------------------------------------------------------
 _marker_models = None
 _marker_models_lock = None  # inicializado em _get_marker_models para evitar import no topo
+_docling_converter = None
+_docling_converter_lock = None
+_gpu_stage_lock = threading.Lock()
+EASYOCR_DISABLED_REASON = "temporariamente desabilitado em ROCm por instabilidade/meta-tensor"
+
+
+
+
+def _torch_runtime_snapshot() -> Dict[str, Any]:
+    try:
+        import torch
+    except Exception as exc:
+        return {"torch_available": False, "error": str(exc)}
+
+    snapshot: Dict[str, Any] = {
+        "torch_available": True,
+        "cuda_available": bool(getattr(torch.cuda, "is_available", lambda: False)()),
+        "torch_version": getattr(torch, "__version__", None),
+        "cuda_version": getattr(torch.version, "cuda", None),
+        "hip_version": getattr(torch.version, "hip", None),
+        "torch_device_env": os.environ.get("TORCH_DEVICE"),
+        "alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+        "hipblas_workspace_config": os.environ.get("HIPBLAS_WORKSPACE_CONFIG"),
+    }
+    if snapshot["cuda_available"]:
+        try:
+            idx = torch.cuda.current_device()
+            snapshot.update({
+                "device_index": idx,
+                "device_name": torch.cuda.get_device_name(idx),
+                "memory_allocated_mb": round(torch.cuda.memory_allocated(idx) / (1024 * 1024), 2),
+                "memory_reserved_mb": round(torch.cuda.memory_reserved(idx) / (1024 * 1024), 2),
+            })
+        except Exception as exc:
+            snapshot["device_error"] = str(exc)
+    return snapshot
+
+
+def _log_torch_runtime(label: str, logs: Optional[List[str]] = None) -> None:
+    snap = _torch_runtime_snapshot()
+    msg = f"{label}: torch={json.dumps(snap, ensure_ascii=False, sort_keys=True)}"
+    logger.info(msg)
+    if logs is not None:
+        logs.append(msg)
+
+
+def _torch_empty_cache(logs: Optional[List[str]] = None, reason: Optional[str] = None) -> None:
+    try:
+        import torch
+        if getattr(torch.cuda, "is_available", lambda: False)():
+            torch.cuda.empty_cache()
+            suffix = f" ({reason})" if reason else ""
+            detail = f"torch.cuda.empty_cache() executado{suffix}"
+            logger.info(detail)
+            if logs is not None:
+                logs.append(detail)
+    except Exception as exc:
+        logger.debug("Falha ao limpar cache torch: %s", exc)
+        if logs is not None:
+            logs.append(f"torch.cuda.empty_cache() falhou: {exc}")
+
+
+def _effective_easyocr_enabled(requested: bool) -> bool:
+    if requested:
+        logger.warning("EasyOCR solicitado, mas ignorado: %s", EASYOCR_DISABLED_REASON)
+    return False
+
+
+def _get_docling_converter():
+    global _docling_converter, _docling_converter_lock
+    import threading as _threading
+
+    if _docling_converter_lock is None:
+        _docling_converter_lock = _threading.Lock()
+
+    with _docling_converter_lock:
+        if _docling_converter is None:
+            from docling.datamodel.base_models import InputFormat  # type: ignore
+            from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
+            from docling.document_converter import DocumentConverter, PdfFormatOption  # type: ignore
+
+            pipeline_options = PdfPipelineOptions()
+            pipeline_options.do_ocr = False
+            _docling_converter = DocumentConverter(
+                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+            )
+    return _docling_converter
 
 
 def _get_marker_models():
@@ -79,13 +172,16 @@ def _get_marker_models():
                 device = "cuda" if torch.cuda.is_available() else "cpu"
             logger.info(
                 "Inicializando Marker/Surya com device=%s "
-                "(torch.cuda.is_available=%s, torch.version.cuda=%s, TORCH_DEVICE_ENV=%s)",
+                "(torch.cuda.is_available=%s, torch.version.cuda=%s, torch.version.hip=%s, TORCH_DEVICE_ENV=%s)",
                 device,
                 torch.cuda.is_available(),
                 getattr(torch.version, "cuda", "N/A"),
+                getattr(torch.version, "hip", "N/A"),
                 torch_device_env or "<não definido>",
             )
+            _log_torch_runtime("marker:init:before-load")
             _marker_models = create_model_dict(device=device)
+            _log_torch_runtime("marker:init:after-load")
     return _marker_models
 
 
@@ -95,12 +191,16 @@ def _preload_marker():
     try:
         logger.info(
             "Pré-carregando modelos Marker/Surya (MODEL_CACHE_DIR=%s) | "
-            "torch.cuda.is_available()=%s | torch.version.cuda=%s",
+            "torch.cuda.is_available()=%s | torch.version.cuda=%s | torch.version.hip=%s",
             MARKER_MODEL_DIR,
             torch.cuda.is_available(),
             getattr(torch.version, "cuda", "N/A"),
+            getattr(torch.version, "hip", "N/A"),
         )
-        _get_marker_models()
+        with _gpu_stage_lock:
+            _log_torch_runtime("marker:preload:before")
+            _get_marker_models()
+            _log_torch_runtime("marker:preload:after")
         logger.info("Modelos Marker carregados com sucesso.")
     except Exception as e:
         logger.warning("Falha ao pré-carregar Marker: %s", e)
@@ -363,19 +463,8 @@ EASYOCR_MODEL_DIR = str(STORAGE_ROOT / "easyocr_models")
 
 
 def _preload_easyocr():
-    """Pré-carrega modelos EasyOCR em background para evitar delay na primeira inferência."""
-    try:
-        import easyocr
-        logger.info("Pré-carregando modelos EasyOCR (model_storage_directory=%s)...", EASYOCR_MODEL_DIR)
-        try:
-            _ = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
-            logger.info("Modelos EasyOCR carregados com sucesso (GPU).")
-        except Exception as gpu_err:
-            logger.warning("EasyOCR GPU falhou (%s), recarregando em CPU...", gpu_err)
-            _ = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
-            logger.info("Modelos EasyOCR carregados com sucesso (CPU fallback).")
-    except Exception as e:
-        logger.warning("Falha ao pré-carregar EasyOCR: %s", e)
+    """EasyOCR está desabilitado temporariamente em ROCm por instabilidade."""
+    logger.warning("Pré-carregamento EasyOCR ignorado: %s", EASYOCR_DISABLED_REASON)
 
 
 @app.on_event("startup")
@@ -390,16 +479,16 @@ async def startup():
         "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
         PARSER_MODE,
         MAX_WORKERS,
-        ENABLE_EASYOCR,
+        False,
         FORCE_OCR_IF_SCORE_BELOW,
         REPROCESS_IF_SCORE_BELOW,
     )
+    _log_torch_runtime("startup")
     Path(MARKER_MODEL_DIR).mkdir(parents=True, exist_ok=True)
     threading.Thread(target=_preload_marker, daemon=True, name="marker-preload").start()
     logger.info("Thread de pré-carregamento Marker iniciada em background.")
     if ENABLE_EASYOCR:
-        threading.Thread(target=_preload_easyocr, daemon=True, name="easyocr-preload").start()
-        logger.info("Thread de pré-carregamento EasyOCR iniciada em background.")
+        logger.warning("ENABLE_EASYOCR=true ignorado: %s", EASYOCR_DISABLED_REASON)
 
 
 _init_job_store()
@@ -419,7 +508,8 @@ def health():
     return {
         "status": "ok",
         "tesseract": tess_ok,
-        "easyocr_enabled": ENABLE_EASYOCR,
+        "easyocr_enabled": False,
+        "easyocr_disabled_reason": EASYOCR_DISABLED_REASON,
         "parser_mode": PARSER_MODE,
         "force_ocr_if_score_below": FORCE_OCR_IF_SCORE_BELOW,
         "reprocess_if_score_below": REPROCESS_IF_SCORE_BELOW,
@@ -646,7 +736,7 @@ def _process_job_sync(job_id: str, req: ParseRequest):
     t0 = time.time()
     doc_results: List[Dict[str, Any]] = []
     errors: List[str] = []
-    use_easyocr = (req.options and req.options.enable_easyocr) or ENABLE_EASYOCR
+    use_easyocr = _effective_easyocr_enabled((req.options and req.options.enable_easyocr) or ENABLE_EASYOCR)
     force_ocr = bool(req.options and req.options.force_ocr)
     target_dir = STORAGE_ROOT / req.tender_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -937,19 +1027,13 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logs.append("docling: não instalado — pulado")
         if _docling_available:
             try:
-                from docling.datamodel.base_models import InputFormat  # type: ignore
-                from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
-                from docling.document_converter import PdfFormatOption  # type: ignore
-
-                pipeline_options = PdfPipelineOptions()
-                pipeline_options.do_ocr = False
-
-                converter = DocumentConverter(
-                    format_options={
-                        InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-                    }
-                )
-                result = converter.convert(str(path))
+                with _gpu_stage_lock:
+                    _torch_empty_cache(logs, "antes do docling")
+                    _log_torch_runtime("docling:before", logs)
+                    converter = _get_docling_converter()
+                    result = converter.convert(str(path))
+                    _log_torch_runtime("docling:after", logs)
+                _torch_empty_cache(logs, "após docling")
                 docling_text = result.document.export_to_text() if result and result.document else ""
                 docling_text = _normalize_text(docling_text)
                 if docling_text:
@@ -979,10 +1063,15 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         try:
             from marker.converters.pdf import PdfConverter  # type: ignore
             from marker.output import text_from_rendered  # type: ignore
-            models = _get_marker_models()
-            converter = PdfConverter(artifact_dict=models)
-            rendered = converter(str(path))
-            full_text_md, _, _ = text_from_rendered(rendered)
+            with _gpu_stage_lock:
+                _torch_empty_cache(logs, "antes do marker")
+                _log_torch_runtime("marker:before", logs)
+                models = _get_marker_models()
+                converter = PdfConverter(artifact_dict=models)
+                rendered = converter(str(path))
+                full_text_md, _, _ = text_from_rendered(rendered)
+                _log_torch_runtime("marker:after", logs)
+            _torch_empty_cache(logs, "após marker")
             marker_text = _normalize_text(full_text_md or "")
             if marker_text:
                 marker_pages = pages or 1
@@ -1033,6 +1122,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
+    use_easyocr = _effective_easyocr_enabled(use_easyocr)
     import pytesseract
     from PIL import Image
     try:
@@ -1101,6 +1191,7 @@ def _parse_html(path: Path) -> Dict:
 
 
 def _parse_image_ocr(path: Path, use_easyocr: bool) -> Dict:
+    use_easyocr = _effective_easyocr_enabled(use_easyocr)
     filename = path.name
     try:
         from PIL import Image

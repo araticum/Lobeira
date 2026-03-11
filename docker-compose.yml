@@ -6,7 +6,9 @@ services:
     volumes:
       - ./storage:/app/storage
     environment:
-      - ENABLE_EASYOCR=true
+      - ENABLE_EASYOCR=false
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+      - HIPBLAS_WORKSPACE_CONFIG=:4096:8
       - MAX_WORKERS=2
       - LOG_LEVEL=INFO
       - PARSER_MODE=precision_first

@@ -65,23 +65,17 @@ environment:
 
 E adicione o serviço `parser` ao mesmo compose (ou use a rede Docker interna).
 
-## Habilitar EasyOCR (opt-in — imagens complexas)
+## EasyOCR
 
-> ⚠️ Aumenta muito o tamanho da imagem (~3GB com PyTorch CPU).
-
-```bash
-# Build com EasyOCR
-docker-compose build --build-arg ENABLE_EASYOCR=true
-
-# Ou via env no runtime (se já instalado na imagem)
-ENABLE_EASYOCR=true docker-compose up
-```
+> ⚠️ EasyOCR está temporariamente desabilitado no runtime ROCm deste serviço por instabilidade com meta tensors/device move. Mesmo que `ENABLE_EASYOCR=true` seja enviado, o parser ignora a flag e mantém o fallback OCR em Tesseract.
 
 ## Variáveis de ambiente
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `ENABLE_EASYOCR` | `false` | Habilita EasyOCR como fallback OCR |
+| `ENABLE_EASYOCR` | `false` | Mantida apenas por compatibilidade; o runtime atual ignora a flag e desabilita EasyOCR |
+| `PYTORCH_CUDA_ALLOC_CONF` | `expandable_segments:True` | Default conservador para reduzir fragmentação/OOM em ROCm |
+| `HIPBLAS_WORKSPACE_CONFIG` | `:4096:8` | Limita workspace hipBLAS por padrão sem sobrescrever override explícito |
 | `MAX_WORKERS` | `2` | Jobs simultâneos |
 | `LOG_LEVEL` | `INFO` | Nível de log (DEBUG/INFO/WARNING) |
 | `STORAGE_ROOT` | `/app/storage` | Pasta de armazenamento temporário |
