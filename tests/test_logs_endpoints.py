@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 import os
 import shutil
 import sys
@@ -72,6 +73,15 @@ sys.modules.setdefault(
     ),
 )
 sys.modules.setdefault("pydantic", types.SimpleNamespace(BaseModel=_BaseModel))
+
+
+
+
+class _CompletedProcess:
+    def __init__(self, stdout="", stderr="", returncode=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
 
 
 class LogsEndpointsTests(unittest.TestCase):
@@ -156,6 +166,62 @@ class LogsEndpointsTests(unittest.TestCase):
         payload = self.main.queue_status()
 
         self.assertEqual(payload, {"pending": 0, "processing": 0, "done": 2})
+
+    def test_get_recent_system_logs_reads_journalctl_and_filters_access_logs(self):
+        lines = "\n".join([
+            json.dumps({
+                "__REALTIME_TIMESTAMP": "1710000000000000",
+                "PRIORITY": "6",
+                "SYSLOG_IDENTIFIER": "parser-monstro",
+                "MESSAGE": "GET /health 200 OK",
+            }),
+            json.dumps({
+                "__REALTIME_TIMESTAMP": "1710000001000000",
+                "PRIORITY": "4",
+                "SYSLOG_IDENTIFIER": "parser-monstro",
+                "MESSAGE": "ROCm warning: meta tensor fallback ativado",
+            }),
+        ])
+        original_run = self.main.subprocess.run
+        self.main.subprocess.run = lambda *args, **kwargs: _CompletedProcess(stdout=lines, returncode=0)
+        try:
+            payload = self.main.get_recent_system_logs(limit=20, since="1 hour ago", contains="ROCm", include_access_logs=False)
+        finally:
+            self.main.subprocess.run = original_run
+
+        self.assertEqual(payload["backend"], "journalctl")
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["message"], "ROCm warning: meta tensor fallback ativado")
+        self.assertEqual(payload["filters"]["contains"], "ROCm")
+
+    def test_get_recent_system_logs_falls_back_to_in_memory_buffer_when_journalctl_fails(self):
+        original_run = self.main.subprocess.run
+        self.main.subprocess.run = lambda *args, **kwargs: _CompletedProcess(stderr="access denied", returncode=1)
+        try:
+            self.main.logger.warning("GPU OOM detectado no fallback de memória")
+            payload = self.main.get_recent_system_logs(limit=20, include_access_logs=False)
+        finally:
+            self.main.subprocess.run = original_run
+
+        self.assertEqual(payload["backend"], "in_memory")
+        self.assertTrue(payload["warnings"])
+        self.assertTrue(any("GPU OOM" in item["message"] for item in payload["items"]))
+
+    def test_get_recent_system_logs_file_fallback_respects_contains_filter(self):
+        system_log_path = Path(self.tmpdir) / "parser-system.log"
+        system_log_path.write_text("GET /queue 200\nMarker loaded successfully\nROCm fallback enabled\n", encoding="utf-8")
+        self.main.SYSTEM_LOG_FILE_PATH = str(system_log_path)
+
+        original_run = self.main.subprocess.run
+        self.main.subprocess.run = lambda *args, **kwargs: _CompletedProcess(stderr="journal unavailable", returncode=1)
+        try:
+            payload = self.main.get_recent_system_logs(limit=20, contains="fallback", include_access_logs=False)
+        finally:
+            self.main.subprocess.run = original_run
+
+        self.assertEqual(payload["backend"], "file")
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["items"][0]["message"], "ROCm fallback enabled")
 
     def test_active_job_logs_and_queue_remain_visible_during_processing(self):
         req = self.main.ParseRequest(

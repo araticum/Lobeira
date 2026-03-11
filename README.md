@@ -48,6 +48,17 @@ curl http://localhost:7000/jobs/<job_id>
 curl http://localhost:7000/queue
 ```
 
+### Ver logs recentes do job store
+```bash
+curl http://localhost:7000/logs/recent
+curl http://localhost:7000/logs/job/<job_id>
+```
+
+### Ver logs do sistema (journald/systemd com fallback)
+```bash
+curl "http://localhost:7000/logs/system/recent?limit=50&contains=rocm"
+```
+
 ## Integração com o Monstro (backend principal)
 
 Defina a variável de ambiente `PARSER_URL` no backend:
@@ -79,6 +90,9 @@ E adicione o serviço `parser` ao mesmo compose (ou use a rede Docker interna).
 | `MAX_WORKERS` | `2` | Jobs simultâneos |
 | `LOG_LEVEL` | `INFO` | Nível de log (DEBUG/INFO/WARNING) |
 | `STORAGE_ROOT` | `/app/storage` | Pasta de armazenamento temporário |
+| `PARSER_SYSTEMD_UNIT` | vazio | Unidade systemd para consultar com `journalctl -u`; se vazio tenta `INVOCATION_ID` e depois `SYSLOG_IDENTIFIER=parser-monstro` |
+| `PARSER_SYSTEM_LOG_PATH` | vazio | Fallback opcional de arquivo de log local quando `journalctl` não estiver disponível/permitido |
+| `SYSTEM_LOG_HISTORY_LIMIT` | `500` | Tamanho do buffer em memória usado como último fallback para `/logs/system/recent` |
 
 ## Endpoints
 
@@ -88,3 +102,21 @@ E adicione o serviço `parser` ao mesmo compose (ou use a rede Docker interna).
 | `GET` | `/jobs/{job_id}` | Status e resultado do job |
 | `GET` | `/health` | Health check |
 | `GET` | `/queue` | Contadores da fila |
+| `GET` | `/logs/recent` | Jobs recentes com logs resumidos |
+| `GET` | `/logs/job/{job_id}` | Logs detalhados de um job, incluindo documentos |
+| `GET` | `/logs/system/recent` | Logs estruturados do runtime via `journalctl`, com filtros `limit`, `since`, `contains` e exclusão padrão de access logs |
+
+
+## Observabilidade de logs do sistema
+
+O endpoint `GET /logs/system/recent` foi pensado para o cenário real em Linux com systemd/journald. Ele tenta, nesta ordem:
+
+1. `journalctl` em JSON (`INVOCATION_ID` atual quando disponível, senão `PARSER_SYSTEMD_UNIT`, senão `SYSLOG_IDENTIFIER=parser-monstro`)
+2. arquivo local definido por `PARSER_SYSTEM_LOG_PATH`
+3. buffer em memória do processo atual
+
+Por padrão o endpoint remove linhas ruidosas de access log/health/queue/logs para destacar mensagens úteis de runtime (ex.: ROCm, fallback, init de modelos, OOM, warnings). Use `include_access_logs=true` para ver tudo.
+
+### Caveat de permissão
+
+Em alguns deploys o processo do parser pode não ter permissão para ler o journal do host. Nesse caso o endpoint não quebra: ele retorna `warnings` explicando a falha e usa o fallback disponível. Para ter a visão mais completa, garanta que o serviço possa executar `journalctl` com acesso ao journal correspondente, ou configure `PARSER_SYSTEM_LOG_PATH`.

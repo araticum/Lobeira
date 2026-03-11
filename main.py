@@ -7,6 +7,8 @@ import asyncio
 import base64
 import json
 import logging
+import subprocess
+from collections import deque
 import os
 import re
 import sqlite3
@@ -16,7 +18,7 @@ import unicodedata
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Optional
 
 import httpx
 import magic
@@ -54,6 +56,49 @@ CLEAN_OCR_NOISE = os.getenv("CLEAN_OCR_NOISE", "true").lower() == "true"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("parser-monstro")
+
+SYSTEM_LOG_HISTORY_LIMIT = int(os.getenv("SYSTEM_LOG_HISTORY_LIMIT", "500"))
+SYSTEM_LOG_FILE_PATH = os.getenv("PARSER_SYSTEM_LOG_PATH", "").strip()
+SYSTEMD_UNIT = os.getenv("PARSER_SYSTEMD_UNIT", os.getenv("SYSTEMD_UNIT", "")).strip()
+SYSTEMD_INVOCATION_ID = os.getenv("INVOCATION_ID", "").strip()
+SYSTEM_LOG_ACCESS_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r'\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+/(health|queue|jobs|logs)(?:\b|/)',
+        r'\b/health\b',
+        r'\b(liveness|readiness|healthcheck)\b',
+        r'\b127\.0\.0\.1:\d+ - "(?:GET|HEAD) /',
+    )
+]
+_system_log_buffer: Deque[Dict[str, Any]] = deque(maxlen=max(50, SYSTEM_LOG_HISTORY_LIMIT))
+_system_log_buffer_lock = threading.Lock()
+
+
+class _SystemLogBufferHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            created_at = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
+            entry = {
+                "timestamp": created_at,
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+                "source": "in_memory",
+            }
+            with _system_log_buffer_lock:
+                _system_log_buffer.append(entry)
+        except Exception:
+            pass
+
+
+def _ensure_system_log_capture_handler() -> None:
+    for handler in logger.handlers:
+        if isinstance(handler, _SystemLogBufferHandler):
+            return
+    logger.addHandler(_SystemLogBufferHandler())
+
+
+_ensure_system_log_capture_handler()
 
 # ---------------------------------------------------------------------------
 # Marker global model cache (evita recarregar modelos a cada chamada)
@@ -529,6 +574,168 @@ def get_job(job_id: str):
     return job
 
 
+def _normalize_system_log_entry(entry: Dict[str, Any], source: str) -> Dict[str, Any]:
+    timestamp = (
+        entry.get("timestamp")
+        or entry.get("__REALTIME_TIMESTAMP")
+        or entry.get("_SOURCE_REALTIME_TIMESTAMP")
+        or entry.get("ts")
+    )
+    if timestamp and str(timestamp).isdigit():
+        timestamp = datetime.fromtimestamp(int(str(timestamp)) / 1_000_000, tz=timezone.utc).isoformat()
+
+    return {
+        "timestamp": timestamp,
+        "level": entry.get("level") or entry.get("PRIORITY") or entry.get("priority"),
+        "logger": entry.get("logger") or entry.get("SYSLOG_IDENTIFIER") or entry.get("_COMM"),
+        "pid": entry.get("pid") or entry.get("_PID"),
+        "message": entry.get("message") or entry.get("MESSAGE") or "",
+        "source": source,
+    }
+
+
+def _is_noisy_system_log_message(message: str) -> bool:
+    return any(pattern.search(message or "") for pattern in SYSTEM_LOG_ACCESS_PATTERNS)
+
+
+def _filter_system_log_entries(
+    entries: Iterable[Dict[str, Any]],
+    limit: int,
+    contains: Optional[str] = None,
+    include_access_logs: bool = False,
+) -> List[Dict[str, Any]]:
+    contains_normalized = (contains or "").strip().lower()
+    filtered: List[Dict[str, Any]] = []
+    for raw_entry in entries:
+        entry = _normalize_system_log_entry(raw_entry, raw_entry.get("source", "unknown"))
+        message = entry.get("message") or ""
+        if not include_access_logs and _is_noisy_system_log_message(message):
+            continue
+        if contains_normalized and contains_normalized not in message.lower():
+            continue
+        filtered.append(entry)
+
+    filtered.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
+    return filtered[:limit]
+
+
+def _read_system_logs_from_buffer(
+    limit: int,
+    contains: Optional[str] = None,
+    include_access_logs: bool = False,
+) -> List[Dict[str, Any]]:
+    with _system_log_buffer_lock:
+        snapshot = [dict(entry) for entry in _system_log_buffer]
+    return _filter_system_log_entries(snapshot, limit=limit, contains=contains, include_access_logs=include_access_logs)
+
+
+def _read_system_logs_from_file(
+    log_path: str,
+    limit: int,
+    contains: Optional[str] = None,
+    include_access_logs: bool = False,
+) -> List[Dict[str, Any]]:
+    path = Path(log_path)
+    if not path.exists() or not path.is_file():
+        return []
+
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    entries = [
+        {"timestamp": None, "level": None, "logger": None, "pid": None, "message": line, "source": "file"}
+        for line in lines[-max(limit * 5, limit):]
+        if line.strip()
+    ]
+    return _filter_system_log_entries(entries, limit=limit, contains=contains, include_access_logs=include_access_logs)
+
+
+def _journalctl_args(limit: int, since: Optional[str]) -> List[str]:
+    args = ["journalctl", "--no-pager", "-o", "json", "-n", str(max(limit * 5, limit))]
+    if since:
+        args.extend(["--since", since])
+    if SYSTEMD_INVOCATION_ID:
+        args.append(f"_SYSTEMD_INVOCATION_ID={SYSTEMD_INVOCATION_ID}")
+    elif SYSTEMD_UNIT:
+        args.extend(["-u", SYSTEMD_UNIT])
+    else:
+        args.append("SYSLOG_IDENTIFIER=parser-monstro")
+    return args
+
+
+def _read_system_logs_from_journal(
+    limit: int,
+    since: Optional[str] = None,
+    contains: Optional[str] = None,
+    include_access_logs: bool = False,
+) -> Dict[str, Any]:
+    args = _journalctl_args(limit, since)
+    completed = subprocess.run(args, capture_output=True, text=True, check=False, timeout=10)
+    if completed.returncode != 0:
+        raise RuntimeError((completed.stderr or completed.stdout or "journalctl failed").strip())
+
+    entries = []
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item["source"] = "journalctl"
+        entries.append(item)
+
+    return {
+        "backend": "journalctl",
+        "entries": _filter_system_log_entries(entries, limit=limit, contains=contains, include_access_logs=include_access_logs),
+    }
+
+
+def _get_system_logs(
+    limit: int,
+    since: Optional[str] = None,
+    contains: Optional[str] = None,
+    include_access_logs: bool = False,
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    backend = None
+    entries: List[Dict[str, Any]] = []
+
+    try:
+        result = _read_system_logs_from_journal(limit=limit, since=since, contains=contains, include_access_logs=include_access_logs)
+        backend = result["backend"]
+        entries = result["entries"]
+    except Exception as exc:
+        warnings.append(f"journalctl indisponível ou sem permissão: {exc}")
+
+    if not entries and SYSTEM_LOG_FILE_PATH:
+        file_entries = _read_system_logs_from_file(SYSTEM_LOG_FILE_PATH, limit=limit, contains=contains, include_access_logs=include_access_logs)
+        if file_entries:
+            backend = "file"
+            entries = file_entries
+
+    if not entries:
+        buffer_entries = _read_system_logs_from_buffer(limit=limit, contains=contains, include_access_logs=include_access_logs)
+        if buffer_entries:
+            backend = "in_memory"
+            entries = buffer_entries
+
+    return {
+        "backend": backend or "none",
+        "filters": {
+            "limit": limit,
+            "since": since,
+            "contains": contains,
+            "include_access_logs": include_access_logs,
+            "systemd_unit": SYSTEMD_UNIT or None,
+            "invocation_id": SYSTEMD_INVOCATION_ID or None,
+            "fallback_file_path": SYSTEM_LOG_FILE_PATH or None,
+        },
+        "count": len(entries),
+        "items": entries,
+        "warnings": warnings,
+    }
+
+
 def _build_job_logs_payload(job_id: str, include_documents: bool = False) -> Dict[str, Any]:
     job = _job_store_get(job_id)
     if job is None:
@@ -568,6 +775,21 @@ def get_recent_logs(limit: int = Query(default=20, ge=1, le=100)):
 @app.get("/logs/job/{job_id}")
 def get_job_logs(job_id: str):
     return _build_job_logs_payload(job_id, include_documents=True)
+
+
+@app.get("/logs/system/recent")
+def get_recent_system_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    since: Optional[str] = Query(default=None),
+    contains: Optional[str] = Query(default=None),
+    include_access_logs: bool = Query(default=False),
+):
+    return _get_system_logs(
+        limit=limit,
+        since=since,
+        contains=contains,
+        include_access_logs=include_access_logs,
+    )
 
 
 @app.get("/storage/{tender_id}")
@@ -722,6 +944,7 @@ async def _process_job(job_id: str, req: ParseRequest):
     async with semaphore:
         _job_store_update(job_id, status="processing")
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] worker iniciou processamento")
+        logger.info("Job %s mudou para processing (tender_id=%s, documentos=%d)", job_id, req.tender_id, len(req.documents))
         await asyncio.to_thread(_process_job_sync, job_id, req)
         job = _job_store_get(job_id)
         purge_at_iso = job.get("purge_at") if job else None
@@ -744,11 +967,13 @@ def _process_job_sync(job_id: str, req: ParseRequest):
     try:
         for index, doc in enumerate(req.documents, start=1):
             _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(req.documents)}: {doc.filename}")
+            logger.info("Job %s processando documento %s/%s: %s", job_id, index, len(req.documents), doc.filename)
             try:
                 results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr))
                 doc_results.extend(results)
                 _replace_job_documents(job_id, doc_results)
                 _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] documento concluído: {doc.filename} ({len(results)} arquivo(s) gerado(s))")
+                logger.info("Job %s concluiu documento %s com %d resultado(s)", job_id, doc.filename, len(results))
             except Exception as exc:
                 logger.exception("Erro ao processar %s", doc.filename)
                 err = f"{doc.filename}: {exc}"
