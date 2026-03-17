@@ -462,6 +462,15 @@ def _job_store_list_recent(limit: int) -> List[Dict[str, Any]]:
     return [_row_to_job(row) for row in rows]
 
 
+def _job_store_list_active(limit: int = 20) -> List[Dict[str, Any]]:
+    with _job_store_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'processing', 'error') ORDER BY updated_at DESC, job_id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [_row_to_job(row) for row in rows]
+
+
 def _job_store_queue_counts() -> Dict[str, Any]:
     counts: Dict[str, Any] = {"pending": 0, "processing": 0, "done": 0, "max_workers": MAX_WORKERS, "slots_in_use": 0, "slots_free": MAX_WORKERS, "oldest_pending_age_s": 0.0}
     with _job_store_connection() as conn:
@@ -673,7 +682,7 @@ def health():
 @app.get("/queue")
 def queue_status():
     queue = _job_store_queue_counts()
-    recent_jobs = _job_store_list_recent(10)
+    active_source_jobs = _job_store_list_active(20)
     active_jobs = [
         {
             "job_id": job.get("job_id"),
@@ -686,8 +695,7 @@ def queue_status():
             "current_document": job.get("current_document"),
             "current_step": job.get("current_step"),
         }
-        for job in recent_jobs
-        if job.get("status") in {"pending", "processing", "error"}
+        for job in active_source_jobs
     ]
     return {**queue, "parser_mode": PARSER_MODE, "active_jobs": active_jobs}
 
