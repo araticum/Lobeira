@@ -426,12 +426,15 @@ def _job_store_list_recent(limit: int) -> List[Dict[str, Any]]:
     return [_row_to_job(row) for row in rows]
 
 
-def _job_store_queue_counts() -> Dict[str, int]:
-    counts = {"pending": 0, "processing": 0, "done": 0}
+def _job_store_queue_counts() -> Dict[str, Any]:
+    counts: Dict[str, Any] = {"pending": 0, "processing": 0, "done": 0, "max_workers": MAX_WORKERS, "slots_in_use": 0, "slots_free": MAX_WORKERS, "oldest_pending_age_s": 0.0}
     with _job_store_connection() as conn:
         rows = conn.execute(
             "SELECT status, COUNT(*) AS total FROM jobs GROUP BY status"
         ).fetchall()
+        oldest_pending = conn.execute(
+            "SELECT MIN(created_at) AS oldest_pending FROM jobs WHERE status = 'pending'"
+        ).fetchone()
     for row in rows:
         status = row["status"]
         total = int(row["total"])
@@ -439,6 +442,11 @@ def _job_store_queue_counts() -> Dict[str, int]:
             counts["done"] += total
         elif status in counts:
             counts[status] = total
+    counts["slots_in_use"] = min(MAX_WORKERS, int(counts["processing"]))
+    counts["slots_free"] = max(0, MAX_WORKERS - int(counts["slots_in_use"]))
+    oldest_created = oldest_pending["oldest_pending"] if oldest_pending else None
+    if oldest_created:
+        counts["oldest_pending_age_s"] = round(max(0.0, time.time() - float(oldest_created)), 2)
     return counts
 
 
@@ -486,6 +494,9 @@ class ParseRequest(BaseModel):
     documents: List[DocumentInput]
     purge_after_days: int = 7
     options: Optional[ParseOptions] = None
+    pipeline_job_id: Optional[int] = None
+    correlation_id: Optional[str] = None
+    celery_task_id: Optional[str] = None
 
 
 class DownloadRequest(BaseModel):
@@ -520,6 +531,9 @@ class ParseResponse(BaseModel):
     tender_id: str
     status: str  # done | error | pending | processing
     job_id: str
+    pipeline_job_id: Optional[int] = None
+    correlation_id: Optional[str] = None
+    celery_task_id: Optional[str] = None
     documents: List[DocumentResult] = []
     full_text: str = ""
     errors: List[str] = []
@@ -592,6 +606,7 @@ def health():
         tess_ok = True
     except Exception:
         tess_ok = False
+    queue = _job_store_queue_counts()
     return {
         "status": "ok",
         "tesseract": tess_ok,
@@ -600,12 +615,19 @@ def health():
         "parser_mode": PARSER_MODE,
         "force_ocr_if_score_below": FORCE_OCR_IF_SCORE_BELOW,
         "reprocess_if_score_below": REPROCESS_IF_SCORE_BELOW,
+        "max_workers": queue["max_workers"],
+        "slots_in_use": queue["slots_in_use"],
+        "slots_free": queue["slots_free"],
+        "pending": queue["pending"],
+        "processing": queue["processing"],
+        "oldest_pending_age_s": queue["oldest_pending_age_s"],
     }
 
 
 @app.get("/queue")
 def queue_status():
-    return _job_store_queue_counts()
+    queue = _job_store_queue_counts()
+    return {**queue, "parser_mode": PARSER_MODE}
 
 
 @app.get("/jobs/{job_id}")
@@ -920,10 +942,13 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
             "job_id": job_id,
             "tender_id": req.tender_id,
             "status": "pending",
+            "pipeline_job_id": req.pipeline_job_id,
+            "correlation_id": req.correlation_id,
+            "celery_task_id": req.celery_task_id,
             "documents": [],
             "full_text": "",
             "errors": [],
-            "logs": [f"[{datetime.now(timezone.utc).isoformat()}] job criado e aguardando worker"],
+            "logs": [f"[{datetime.now(timezone.utc).isoformat()}] job criado e aguardando worker (pipeline_job_id={req.pipeline_job_id}, correlation_id={req.correlation_id}, celery_task_id={req.celery_task_id})"],
             "processing_time_s": 0.0,
             "created_at": time.time(),
             "storage_path": str(storage_path),
@@ -931,10 +956,14 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
         }
     )
     background_tasks.add_task(_process_job, job_id, req)
+    logger.info("parser_job_queued job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s docs_total=%s", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(req.documents))
     return ParseResponse(
         tender_id=req.tender_id,
         status="pending",
         job_id=job_id,
+        pipeline_job_id=req.pipeline_job_id,
+        correlation_id=req.correlation_id,
+        celery_task_id=req.celery_task_id,
     )
 
 
@@ -1005,7 +1034,7 @@ async def _process_job(job_id: str, req: ParseRequest):
     async with semaphore:
         _job_store_update(job_id, status="processing")
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] worker iniciou processamento")
-        logger.info("Job %s mudou para processing (tender_id=%s, documentos=%d)", job_id, req.tender_id, len(req.documents))
+        logger.info("parser_job_started job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s documentos=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(req.documents))
         await asyncio.to_thread(_process_job_sync, job_id, req)
         job = _job_store_get(job_id)
         purge_at_iso = job.get("purge_at") if job else None
@@ -1077,7 +1106,7 @@ def _process_job_sync(job_id: str, req: ParseRequest):
             purge_at=purge_at.isoformat(),
         )
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] job concluído com status={status} em {processing_time:.2f}s")
-        logger.info("Job %s concluído em %.1fs (%d docs)", job_id, processing_time, len(doc_results))
+        logger.info("parser_job_finished job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s status=%s processing_time_s=%.2f docs=%d errors=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, status, processing_time, len(doc_results), len(errors))
     except Exception as exc:
         logger.exception("Falha fatal no job %s", job_id)
         processing_time = round(time.time() - t0, 2)
