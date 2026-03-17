@@ -1,4 +1,4 @@
-# Parser Monstro — Serviço de Extração de Documentos
+# Lobeira — Serviço de Extração de Documentos
 
 Container isolado que extrai texto de documentos de licitação (PDF, DOCX, HTML, imagens, ZIP, RAR, 7z) e expõe uma API REST na porta 7000.
 
