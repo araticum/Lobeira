@@ -329,10 +329,26 @@ def _init_job_store() -> None:
                 full_text TEXT NOT NULL DEFAULT '',
                 storage_path TEXT,
                 purge_at TEXT,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                progress_pct INTEGER NOT NULL DEFAULT 0,
+                documents_done INTEGER NOT NULL DEFAULT 0,
+                documents_total INTEGER NOT NULL DEFAULT 0,
+                current_document TEXT,
+                current_step TEXT
             )
             """
         )
+        existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "progress_pct" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN progress_pct INTEGER NOT NULL DEFAULT 0")
+        if "documents_done" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN documents_done INTEGER NOT NULL DEFAULT 0")
+        if "documents_total" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN documents_total INTEGER NOT NULL DEFAULT 0")
+        if "current_document" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN current_document TEXT")
+        if "current_step" not in existing_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN current_step TEXT")
         conn.commit()
 
 
@@ -355,7 +371,13 @@ def _row_to_job(row: sqlite3.Row) -> Dict[str, Any]:
         "tender_id": row["tender_id"],
         "status": row["status"],
         "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
         "processing_time_s": row["processing_time_s"],
+        "progress_pct": int(row["progress_pct"] or 0),
+        "documents_done": int(row["documents_done"] or 0),
+        "documents_total": int(row["documents_total"] or 0),
+        "current_document": row["current_document"],
+        "current_step": row["current_step"],
         "errors": _json_load(row["errors_json"], []),
         "logs": _json_load(row["logs_json"], []),
         "documents": _json_load(row["documents_json"], []),
@@ -378,7 +400,12 @@ def _job_store_upsert(job: Dict[str, Any]) -> None:
         "full_text": job.get("full_text", ""),
         "storage_path": job.get("storage_path"),
         "purge_at": job.get("purge_at"),
-        "updated_at": time.time(),
+        "updated_at": job.get("updated_at", time.time()),
+        "progress_pct": int(job.get("progress_pct", 0) or 0),
+        "documents_done": int(job.get("documents_done", 0) or 0),
+        "documents_total": int(job.get("documents_total", 0) or 0),
+        "current_document": job.get("current_document"),
+        "current_step": job.get("current_step"),
     }
     with job_store_lock:
         with _job_store_connection() as conn:
@@ -387,11 +414,15 @@ def _job_store_upsert(job: Dict[str, Any]) -> None:
                 INSERT INTO jobs (
                     job_id, tender_id, status, created_at, processing_time_s,
                     errors_json, logs_json, documents_json, full_text,
-                    storage_path, purge_at, updated_at
+                    storage_path, purge_at, updated_at,
+                    progress_pct, documents_done, documents_total,
+                    current_document, current_step
                 ) VALUES (
                     :job_id, :tender_id, :status, :created_at, :processing_time_s,
                     :errors_json, :logs_json, :documents_json, :full_text,
-                    :storage_path, :purge_at, :updated_at
+                    :storage_path, :purge_at, :updated_at,
+                    :progress_pct, :documents_done, :documents_total,
+                    :current_document, :current_step
                 )
                 ON CONFLICT(job_id) DO UPDATE SET
                     tender_id=excluded.tender_id,
@@ -404,7 +435,12 @@ def _job_store_upsert(job: Dict[str, Any]) -> None:
                     full_text=excluded.full_text,
                     storage_path=excluded.storage_path,
                     purge_at=excluded.purge_at,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    progress_pct=excluded.progress_pct,
+                    documents_done=excluded.documents_done,
+                    documents_total=excluded.documents_total,
+                    current_document=excluded.current_document,
+                    current_step=excluded.current_step
                 """,
                 payload,
             )
@@ -456,6 +492,7 @@ def _job_store_update(job_id: str, **updates: Any) -> Dict[str, Any]:
         if current is None:
             raise KeyError(job_id)
         current.update(updates)
+        current['updated_at'] = updates.get('updated_at', time.time())
         _job_store_upsert(current)
         return current
 
@@ -468,12 +505,21 @@ def _append_job_log(job_id: str, message: str) -> Dict[str, Any]:
         logs = list(current.get("logs", []))
         logs.append(message)
         current["logs"] = logs
+        current["updated_at"] = time.time()
         _job_store_upsert(current)
         return current
 
 
 def _replace_job_documents(job_id: str, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
     return _job_store_update(job_id, documents=documents)
+
+
+def _compute_progress(documents_done: int, documents_total: int, status: str) -> int:
+    if status == "done":
+        return 100
+    if documents_total <= 0:
+        return 0
+    return max(0, min(99, int((documents_done / max(1, documents_total)) * 100)))
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +673,23 @@ def health():
 @app.get("/queue")
 def queue_status():
     queue = _job_store_queue_counts()
-    return {**queue, "parser_mode": PARSER_MODE}
+    recent_jobs = _job_store_list_recent(10)
+    active_jobs = [
+        {
+            "job_id": job.get("job_id"),
+            "tender_id": job.get("tender_id"),
+            "status": job.get("status"),
+            "updated_at": job.get("updated_at"),
+            "progress_pct": job.get("progress_pct", 0),
+            "documents_done": job.get("documents_done", 0),
+            "documents_total": job.get("documents_total", 0),
+            "current_document": job.get("current_document"),
+            "current_step": job.get("current_step"),
+        }
+        for job in recent_jobs
+        if job.get("status") in {"pending", "processing", "error"}
+    ]
+    return {**queue, "parser_mode": PARSER_MODE, "active_jobs": active_jobs}
 
 
 @app.get("/jobs/{job_id}")
@@ -829,7 +891,13 @@ def _build_job_logs_payload(job_id: str, include_documents: bool = False) -> Dic
         "tender_id": job.get("tender_id"),
         "status": job.get("status"),
         "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
         "processing_time_s": job.get("processing_time_s", 0.0),
+        "progress_pct": job.get("progress_pct", 0),
+        "documents_done": job.get("documents_done", 0),
+        "documents_total": job.get("documents_total", 0),
+        "current_document": job.get("current_document"),
+        "current_step": job.get("current_step"),
         "errors": job.get("errors", []),
         "logs": job.get("logs", []),
     }
@@ -950,7 +1018,13 @@ async def parse_documents(req: ParseRequest, background_tasks: BackgroundTasks):
             "errors": [],
             "logs": [f"[{datetime.now(timezone.utc).isoformat()}] job criado e aguardando worker (pipeline_job_id={req.pipeline_job_id}, correlation_id={req.correlation_id}, celery_task_id={req.celery_task_id})"],
             "processing_time_s": 0.0,
+            "progress_pct": 0,
+            "documents_done": 0,
+            "documents_total": len(req.documents),
+            "current_document": None,
+            "current_step": "queued",
             "created_at": time.time(),
+            "updated_at": time.time(),
             "storage_path": str(storage_path),
             "purge_at": purge_at.isoformat(),
         }
@@ -1032,7 +1106,7 @@ async def download_documents(req: DownloadRequest):
 # ---------------------------------------------------------------------------
 async def _process_job(job_id: str, req: ParseRequest):
     async with semaphore:
-        _job_store_update(job_id, status="processing")
+        _job_store_update(job_id, status="processing", progress_pct=0, documents_done=0, documents_total=len(req.documents), current_document=None, current_step="starting", updated_at=time.time())
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] worker iniciou processamento")
         logger.info("parser_job_started job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s documentos=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, len(req.documents))
         await asyncio.to_thread(_process_job_sync, job_id, req)
@@ -1054,21 +1128,26 @@ def _process_job_sync(job_id: str, req: ParseRequest):
     target_dir = STORAGE_ROOT / req.tender_id
     target_dir.mkdir(parents=True, exist_ok=True)
 
+    documents_total = len(req.documents)
+    documents_done = 0
     try:
         for index, doc in enumerate(req.documents, start=1):
+            _job_store_update(job_id, documents_done=documents_done, documents_total=documents_total, progress_pct=_compute_progress(documents_done, documents_total, 'processing'), current_document=doc.filename, current_step='starting_document', updated_at=time.time())
             _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] iniciando documento {index}/{len(req.documents)}: {doc.filename}")
             logger.info("Job %s processando documento %s/%s: %s", job_id, index, len(req.documents), doc.filename)
             try:
                 results = asyncio.run(_handle_document(doc, target_dir, use_easyocr, force_ocr))
                 doc_results.extend(results)
+                documents_done += 1
                 _replace_job_documents(job_id, doc_results)
+                _job_store_update(job_id, documents_done=documents_done, documents_total=documents_total, progress_pct=_compute_progress(documents_done, documents_total, 'processing'), current_document=doc.filename, current_step='document_done', updated_at=time.time())
                 _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] documento concluído: {doc.filename} ({len(results)} arquivo(s) gerado(s))")
                 logger.info("Job %s concluiu documento %s com %d resultado(s)", job_id, doc.filename, len(results))
             except Exception as exc:
                 logger.exception("Erro ao processar %s", doc.filename)
                 err = f"{doc.filename}: {exc}"
                 errors.append(err)
-                _job_store_update(job_id, errors=errors)
+                _job_store_update(job_id, errors=errors, documents_done=documents_done, documents_total=documents_total, progress_pct=_compute_progress(documents_done, documents_total, 'processing'), current_document=doc.filename, current_step='document_error', updated_at=time.time())
                 _append_job_log(job_id, f"[erro] {err}")
 
         full_text = "\n\n".join(r["text"] for r in doc_results if r.get("text"))
@@ -1104,6 +1183,12 @@ def _process_job_sync(job_id: str, req: ParseRequest):
             processing_time_s=processing_time,
             storage_path=str(target_dir),
             purge_at=purge_at.isoformat(),
+            documents_done=documents_done,
+            documents_total=documents_total,
+            progress_pct=_compute_progress(documents_done, documents_total, status),
+            current_document=None,
+            current_step='finished',
+            updated_at=time.time(),
         )
         _append_job_log(job_id, f"[{datetime.now(timezone.utc).isoformat()}] job concluído com status={status} em {processing_time:.2f}s")
         logger.info("parser_job_finished job_id=%s tender_id=%s pipeline_job_id=%s correlation_id=%s celery_task_id=%s status=%s processing_time_s=%.2f docs=%d errors=%d", job_id, req.tender_id, req.pipeline_job_id, req.correlation_id, req.celery_task_id, status, processing_time, len(doc_results), len(errors))
@@ -1120,6 +1205,12 @@ def _process_job_sync(job_id: str, req: ParseRequest):
             logs=logs,
             processing_time_s=processing_time,
             storage_path=str(target_dir),
+            documents_done=documents_done if 'documents_done' in locals() else 0,
+            documents_total=documents_total if 'documents_total' in locals() else len(req.documents),
+            progress_pct=_compute_progress(documents_done if 'documents_done' in locals() else 0, documents_total if 'documents_total' in locals() else len(req.documents), 'error'),
+            current_document=None,
+            current_step='fatal_error',
+            updated_at=time.time(),
         )
 
 
