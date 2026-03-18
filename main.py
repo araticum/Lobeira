@@ -295,9 +295,27 @@ def _get_marker_models():
                 getattr(torch.version, "hip", "N/A"),
                 torch_device_env or "<não definido>",
             )
+
+            # ROCm/RDNA3: bfloat16 tem bugs severos — operações MIOpen geram workspace em float32,
+            # duplicando o uso de VRAM (~10 GB observado vs ~5 GB documentado).
+            # Forçar float16 que tem suporte nativo robusto no RDNA3.
+            # Marker v2 usa settings.MODEL_DTYPE como propriedade computada para carregar modelos.
+            _dtype_patched = False
+            if device == "cuda" and getattr(torch.version, "hip", None):
+                try:
+                    from marker.settings import settings as _marker_settings  # type: ignore
+                    _orig_dtype_prop = type(_marker_settings).__dict__.get("MODEL_DTYPE")
+                    type(_marker_settings).MODEL_DTYPE = property(lambda self: torch.float16)
+                    _dtype_patched = True
+                    logger.info("marker: MODEL_DTYPE monkey-patched bfloat16 → float16 (ROCm/RDNA3 workaround)")
+                except Exception as _patch_err:
+                    logger.warning("marker: falha ao aplicar patch MODEL_DTYPE: %s", _patch_err)
+
             _log_marker_runtime_settings()
             _log_torch_runtime("marker:init:before-load")
             _marker_models = create_model_dict(device=device)
+            if _dtype_patched:
+                logger.info("marker: modelos carregados com float16 patch ativo")
             _log_torch_runtime("marker:init:after-load")
     return _marker_models
 
