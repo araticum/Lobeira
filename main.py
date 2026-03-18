@@ -1426,6 +1426,7 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
+    global _docling_converter
     filename = path.name
     text = ""
     method = ""
@@ -1502,8 +1503,20 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             except Exception as e:
                 logger.warning("docling falhou em %s: %s", filename, e)
                 logs.append(f"docling: falhou ({e})")
+            finally:
+                # Descarrega explicitamente o conversor docling para liberar VRAM antes do marker
+                _docling_converter = None
+                _torch_empty_cache(logs, "após docling (unload)")
 
-    if not text or native_is_weak or force_ocr:
+    # Marker só entra se ainda não temos texto de qualidade após pymupdf + docling.
+    # Evita carregar modelos pesados quando resultado já é suficiente.
+    _marker_needed = force_ocr or not text or native_is_weak
+    if _marker_needed:
+        logs.append(f"marker: tentando (score atual {quality:.2f}, fraco={native_is_weak})")
+    else:
+        logs.append(f"marker: pulado — resultado já suficiente (score {quality:.2f}, método={method})")
+
+    if _marker_needed:
         try:
             from marker.converters.pdf import PdfConverter  # type: ignore
             from marker.output import text_from_rendered  # type: ignore
