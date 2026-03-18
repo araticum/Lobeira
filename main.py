@@ -50,9 +50,7 @@ os.environ.setdefault(
 
 os.environ.setdefault("HSA_ENABLE_SDMA", "0")
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
 os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 # Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
@@ -65,6 +63,15 @@ os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
 # então baixamos o default sem impedir override explícito via env/deploy.
 os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "4"))
 os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "2"))
+
+# BATCH_MULTIPLIER=1: marker/surya usa esse valor para escalar batch sizes internamente.
+# Default é 2, o que dobra o consumo de VRAM. Forçar 1 reduz o pico sem perda de qualidade.
+os.environ.setdefault("BATCH_MULTIPLIER", os.getenv("MARKER_BATCH_MULTIPLIER_DEFAULT", "1"))
+
+# INFERENCE_RAM + VRAM_PER_TASK: informa ao marker quanto de VRAM está disponível.
+# VRAM_PER_TASK=16 garante que ele não tente rodar workers paralelos na GPU.
+os.environ.setdefault("INFERENCE_RAM", os.getenv("MARKER_INFERENCE_RAM_DEFAULT", "16"))
+os.environ.setdefault("VRAM_PER_TASK", os.getenv("MARKER_VRAM_PER_TASK_DEFAULT", "16"))
 
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
@@ -176,6 +183,10 @@ def _marker_runtime_settings() -> Dict[str, Optional[str]]:
         "torch_device": os.environ.get("TORCH_DEVICE"),
         "recognition_batch_size": os.environ.get("RECOGNITION_BATCH_SIZE"),
         "detector_batch_size": os.environ.get("DETECTOR_BATCH_SIZE"),
+        "batch_multiplier": os.environ.get("BATCH_MULTIPLIER"),
+        "inference_ram": os.environ.get("INFERENCE_RAM"),
+        "vram_per_task": os.environ.get("VRAM_PER_TASK"),
+        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         "model_cache_dir": os.environ.get("MODEL_CACHE_DIR"),
     }
 
