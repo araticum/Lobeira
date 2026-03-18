@@ -73,6 +73,26 @@ os.environ.setdefault("BATCH_MULTIPLIER", os.getenv("MARKER_BATCH_MULTIPLIER_DEF
 os.environ.setdefault("INFERENCE_RAM", os.getenv("MARKER_INFERENCE_RAM_DEFAULT", "16"))
 os.environ.setdefault("VRAM_PER_TASK", os.getenv("MARKER_VRAM_PER_TASK_DEFAULT", "16"))
 
+# ROCm/RDNA3: monkey-patch MODEL_DTYPE bfloat16→float16 na inicialização do módulo.
+# bfloat16 em RDNA3 gera workspace float32 em operações MIOpen, duplicando o uso de VRAM.
+# Deve rodar ANTES de qualquer importação do marker/surya.
+def _patch_marker_dtype_for_rocm() -> None:
+    try:
+        import torch as _t
+        if not getattr(_t.version, "hip", None):
+            return  # só aplica em ROCm
+        from marker.settings import settings as _ms  # type: ignore
+        type(_ms).MODEL_DTYPE = property(lambda self: _t.float16)
+        logging.getLogger("lobeira.parser").info(
+            "marker: MODEL_DTYPE monkey-patched bfloat16→float16 (ROCm/RDNA3 workaround)"
+        )
+    except Exception as _e:
+        logging.getLogger("lobeira.parser").warning(
+            "marker: falha no patch MODEL_DTYPE: %s", _e
+        )
+
+_patch_marker_dtype_for_rocm()
+
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
 REPROCESS_IF_SCORE_BELOW = float(os.getenv("REPROCESS_IF_SCORE_BELOW", "0.72" if PARSER_MODE == "precision_first" else "0.55"))
