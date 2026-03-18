@@ -63,8 +63,8 @@ os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
 # Batch sizes default mais conservadores para ROCm/HIP.
 # Surya costuma escalar demais por padrão em GPU (ex.: recognition 512 ~= ~20GB VRAM),
 # então baixamos o default sem impedir override explícito via env/deploy.
-os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "16"))
-os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "4"))
+os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "4"))
+os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "2"))
 
 # Precision-first knobs (safe defaults for quality)
 FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
