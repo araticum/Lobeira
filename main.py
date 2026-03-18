@@ -231,6 +231,23 @@ def _get_docling_converter():
 
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = False
+
+            # Forçar CPU para docling — mantém VRAM livre para o marker.
+            # Sem perda de qualidade: os pesos são os mesmos; só a latência aumenta levemente.
+            # Permite sobrescrever via env DOCLING_DEVICE=cuda se necessário.
+            docling_device = os.environ.get("DOCLING_DEVICE", "cpu")
+            if docling_device == "cpu":
+                try:
+                    from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice  # type: ignore
+                    pipeline_options.accelerator_options = AcceleratorOptions(
+                        num_threads=4, device=AcceleratorDevice.CPU
+                    )
+                    logger.info("docling: forçado para CPU (DOCLING_DEVICE=cpu)")
+                except Exception as _acc_err:
+                    # fallback: seta env var pra garantir que torch não use GPU no contexto do docling
+                    logger.warning("docling: AcceleratorOptions indisponível (%s) — usando TORCH_DEVICE fallback", _acc_err)
+                    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
             _docling_converter = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
             )
