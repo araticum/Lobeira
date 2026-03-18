@@ -1569,7 +1569,19 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 del rendered
                 del converter
                 _log_torch_runtime("marker:after", logs)
-                # Descarrega modelos do marker imediatamente após uso para liberar VRAM
+                # Move pesos pra CPU antes de deletar — força liberação imediata de VRAM no ROCm
+                try:
+                    import torch as _t
+                    for _obj in models.values():
+                        if hasattr(_obj, 'to'):
+                            try:
+                                _obj.to('cpu')
+                            except Exception:
+                                pass
+                    if getattr(_t.cuda, 'synchronize', None):
+                        _t.cuda.synchronize()
+                except Exception:
+                    pass
                 del models
                 _marker_models = None
             _torch_empty_cache(logs, "após marker (unload)")
