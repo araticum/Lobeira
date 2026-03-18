@@ -1445,7 +1445,7 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
 
 
 def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
-    global _docling_converter
+    global _docling_converter, _marker_models
     filename = path.name
     text = ""
     method = ""
@@ -1558,7 +1558,10 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 del rendered
                 del converter
                 _log_torch_runtime("marker:after", logs)
-            _torch_empty_cache(logs, "após marker")
+                # Descarrega modelos do marker imediatamente após uso para liberar VRAM
+                del models
+                _marker_models = None
+            _torch_empty_cache(logs, "após marker (unload)")
             marker_text = _normalize_text(full_text_md or "")
             if marker_text:
                 marker_pages = pages or 1
