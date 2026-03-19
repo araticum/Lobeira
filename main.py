@@ -1326,7 +1326,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 "mineru",
                 "-p", str(path),
                 "-o", str(_out_dir),
-                "--method", "pipeline",
+                "--method", "auto",
                 "--lang", "pt",
             ]
             _result = _sp.run(
