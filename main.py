@@ -1327,7 +1327,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 "-p", str(path),
                 "-o", str(_out_dir),
                 "--method", "auto",
-                "--lang", "pt",
+                "--lang", "latin",
             ]
             _result = _sp.run(
                 _cmd,
