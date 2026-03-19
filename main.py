@@ -1619,15 +1619,14 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
                 _docling_converter = None
                 _torch_empty_cache(logs, "após docling (unload)")
 
-    # Marker só entra se ainda não temos texto de qualidade após pymupdf + docling.
-    # Evita carregar modelos pesados quando resultado já é suficiente.
-    _marker_needed = force_ocr or not text or native_is_weak
-    if _marker_needed:
-        logs.append(f"marker: tentando (score atual {quality:.2f}, fraco={native_is_weak})")
+    # MinerU entra se ainda não temos texto de qualidade após pymupdf + docling.
+    _mineru_needed = force_ocr or not text or native_is_weak
+    if _mineru_needed:
+        logs.append(f"mineru: tentando (score atual {quality:.2f}, fraco={native_is_weak})")
     else:
-        logs.append(f"marker: pulado — resultado já suficiente (score {quality:.2f}, método={method})")
+        logs.append(f"mineru: pulado — resultado já suficiente (score {quality:.2f}, método={method})")
 
-    if _marker_needed:
+    if _mineru_needed:
         try:
             import torch as _torch_check
             if getattr(_torch_check.cuda, "is_available", lambda: False)():
@@ -1636,75 +1635,63 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             pass
 
         try:
-            from marker.converters.pdf import PdfConverter  # type: ignore
-            from marker.output import text_from_rendered  # type: ignore
-            full_text_md = ""
-            with _gpu_stage_lock:
-                _torch_empty_cache(logs, "antes do marker")
-                _log_marker_runtime_settings(logs)
-                _log_torch_runtime("marker:before", logs)
-                models = _get_marker_models()
-                converter = PdfConverter(artifact_dict=models)
-                rendered = converter(str(path))
-                full_text_md, _, _ = text_from_rendered(rendered)
-                del rendered
-                del converter
-                _log_torch_runtime("marker:after", logs)
-                # Move pesos pra CPU antes de deletar — força liberação imediata de VRAM no ROCm
-                try:
-                    import torch as _t
-                    for _obj in models.values():
-                        if hasattr(_obj, 'to'):
-                            try:
-                                _obj.to('cpu')
-                            except Exception:
-                                pass
-                    if getattr(_t.cuda, 'synchronize', None):
-                        _t.cuda.synchronize()
-                except Exception:
-                    pass
-                del models
-                _marker_models = None
-            _torch_empty_cache(logs, "após marker (unload)")
-            marker_text = _normalize_text(full_text_md or "")
-            if marker_text:
-                marker_pages = pages or 1
-                marker_quality = _quality_score(marker_text, marker_pages)
-                if force_ocr or marker_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                    text = marker_text
-                    pages = marker_pages
-                    quality = marker_quality
-                    method = "marker"
+            import tempfile, subprocess as _sp, json as _json
+            from pathlib import Path as _Path
+
+            _log_torch_runtime("mineru:before", logs)
+
+            with tempfile.TemporaryDirectory() as _tmpdir:
+                _out_dir = _Path(_tmpdir) / "out"
+                _out_dir.mkdir()
+                _cmd = [
+                    "mineru",
+                    "-p", str(path),
+                    "-o", str(_out_dir),
+                    "--method", "pipeline",
+                    "--lang", "pt",
+                ]
+                _env = {**os.environ}
+                _result = _sp.run(
+                    _cmd,
+                    env=_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+                if _result.returncode != 0:
+                    raise RuntimeError(f"mineru returncode={_result.returncode}: {_result.stderr[:500]}")
+
+                # MinerU gera <nome_arquivo>/<nome_arquivo>.md
+                _md_files = list(_out_dir.rglob("*.md"))
+                _mineru_text = ""
+                for _md in _md_files:
+                    _mineru_text += _md.read_text(errors="replace") + "\n"
+
+            _log_torch_runtime("mineru:after", logs)
+
+            mineru_text = _normalize_text(_mineru_text.strip())
+            if mineru_text:
+                mineru_pages = pages or 1
+                mineru_quality = _quality_score(mineru_text, mineru_pages)
+                if force_ocr or mineru_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
+                    text = mineru_text
+                    pages = mineru_pages
+                    quality = mineru_quality
+                    method = "mineru"
                     native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-                    logs.append(f"marker: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
+                    logs.append(f"mineru: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
                 else:
-                    logs.append(f"marker: não melhorou resultado (score {marker_quality:.2f} vs {quality:.2f})")
+                    logs.append(f"mineru: não melhorou resultado (score {mineru_quality:.2f} vs {quality:.2f})")
             else:
-                logs.append("marker: resultado vazio")
-        except ImportError:
-            logger.warning("marker não instalado — pulando etapa 3 do fallback para %s", filename)
-            logs.append("marker: não instalado — pulado")
+                logs.append("mineru: resultado vazio")
+        except FileNotFoundError:
+            logger.warning("mineru não instalado — pulando para %s", filename)
+            logs.append("mineru: não instalado — pulado")
         except Exception as e:
-            _torch_empty_cache(logs, "falha do marker")
-            _log_torch_runtime("marker:failure", logs)
-            # OOM explícito — loga peak memory para diagnóstico
-            oom_names = {"OutOfMemoryError", "RuntimeError"}
-            is_oom = type(e).__name__ in oom_names and ("memory" in str(e).lower() or "alloc" in str(e).lower())
-            if is_oom:
-                try:
-                    import torch as _t
-                    idx = _t.cuda.current_device()
-                    peak_alloc = round(_t.cuda.max_memory_allocated(idx) / 1024**3, 3)
-                    peak_resv = round(_t.cuda.max_memory_reserved(idx) / 1024**3, 3)
-                    free, total = _t.cuda.mem_get_info(idx)
-                    logs.append(
-                        f"marker:OOM — peak_alloc={peak_alloc}GB peak_resv={peak_resv}GB "
-                        f"free={round(free/1024**3,3)}GB total={round(total/1024**3,3)}GB"
-                    )
-                except Exception:
-                    pass
-            logger.warning("marker falhou em %s: %s", filename, e)
-            logs.append(f"marker: falhou ({e})")
+            _torch_empty_cache(logs, "falha do mineru")
+            _log_torch_runtime("mineru:failure", logs)
+            logger.warning("mineru falhou em %s: %s", filename, e)
+            logs.append(f"mineru: falhou ({str(e)[:300]})")
 
     if not text or native_is_weak or force_ocr:
         try:
@@ -1729,7 +1716,7 @@ def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
             logger.warning("ocr falhou em %s: %s", filename, e)
             logs.append(f"ocr: falhou ({e})")
 
-    type_detected = "pdf_native" if method in ("pymupdf", "docling", "marker") else "pdf_scanned"
+    type_detected = "pdf_native" if method in ("pymupdf", "docling", "mineru") else "pdf_scanned"
     return _make_result(filename, type_detected, method or "failed", pages, quality, text, logs=logs)
 
 
