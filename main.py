@@ -5,7 +5,6 @@ API REST FastAPI — roda em container isolado na porta 7000.
 
 import asyncio
 import base64
-import gc
 import json
 import logging
 import subprocess
@@ -34,90 +33,23 @@ from zip_recursive import ZipExtractionLimits, extract_zip_recursive, write_extr
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 PARSER_MODE = os.getenv("PARSER_MODE", "balanced").strip().lower()
-ENABLE_EASYOCR = os.getenv("ENABLE_EASYOCR", "false").lower() == "true"
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1" if PARSER_MODE == "precision_first" else "2"))
 STORAGE_ROOT = Path(os.getenv("STORAGE_ROOT", "/app/storage"))
 JOBS_DB_PATH = STORAGE_ROOT / "jobs.sqlite3"
 
-# ROCm/HIP segue a semântica de torch.cuda; usar device="cuda" é o caminho certo.
-# Preferimos defaults conservadores de alocador/workspace para reduzir fragmentação/OOM,
-# sem sobrescrever overrides explícitos de runtime/deploy.
-# ROCm tuning (WSL stability)
-os.environ.setdefault(
-    "PYTORCH_HIP_ALLOC_CONF",
-    "garbage_collection_threshold:0.8,max_split_size_mb:128"
-)
-
-os.environ.setdefault("HSA_ENABLE_SDMA", "0")
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:512")
-
-# HIPBLAS_WORKSPACE_CONFIG=:0:0 — zera o workspace hipBLAS (antes era :4096:8 = até 4 GB)
-os.environ.setdefault("HIPBLAS_WORKSPACE_CONFIG", ":0:0")
-
-# MIOpen auto-tuning aloca workspaces enormes de convolução — FAST usa heurísticas sem alocar
-os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
-
-# gfx1101 (RX 7800 XT) não tem suporte nativo hipBLASLt — forçar rocBLAS evita alocações extras
-os.environ.setdefault("TORCH_BLAS_PREFER_HIPBLASLT", "0")
-
-# PYTORCH_NO_CUDA_MEMORY_CACHING desabilitado — cega os memory stats e não resolve o OOM
-# os.environ.setdefault("PYTORCH_NO_CUDA_MEMORY_CACHING", "1")
-
-# Marker / Surya usam MODEL_CACHE_DIR para persistir modelos (~1-2 GB)
-# Deve ser definido ANTES da primeira importação de surya/marker
-MARKER_MODEL_DIR = str(STORAGE_ROOT / "marker_models")
-os.environ.setdefault("MODEL_CACHE_DIR", MARKER_MODEL_DIR)
-
-# Batch sizes default mais conservadores para ROCm/HIP.
-# Surya costuma escalar demais por padrão em GPU (ex.: recognition 512 ~= ~20GB VRAM),
-# então baixamos o default sem impedir override explícito via env/deploy.
-# Marker batch sizes (repassados internamente, mas podem não chegar ao surya)
-os.environ.setdefault("RECOGNITION_BATCH_SIZE", os.getenv("MARKER_RECOGNITION_BATCH_SIZE_DEFAULT", "4"))
-os.environ.setdefault("DETECTOR_BATCH_SIZE", os.getenv("MARKER_DETECTOR_BATCH_SIZE_DEFAULT", "2"))
-
-# Surya tem settings.py próprio (Pydantic BaseSettings) com vars independentes.
-# Default de DETECTOR_BATCH_SIZE no surya é 36 (~440 MB/item = ~16 GB só no detector).
-# Esses valores precisam ser setados ANTES de qualquer import do surya/marker.
-os.environ.setdefault("LAYOUT_BATCH_SIZE", os.getenv("SURYA_LAYOUT_BATCH_SIZE_DEFAULT", "2"))
-os.environ.setdefault("TABLE_REC_BATCH_SIZE", os.getenv("SURYA_TABLE_REC_BATCH_SIZE_DEFAULT", "2"))
-os.environ.setdefault("ORDER_BATCH_SIZE", os.getenv("SURYA_ORDER_BATCH_SIZE_DEFAULT", "2"))
-
-# BATCH_MULTIPLIER=1: marker usa esse valor para escalar batch sizes internamente.
-os.environ.setdefault("BATCH_MULTIPLIER", os.getenv("MARKER_BATCH_MULTIPLIER_DEFAULT", "1"))
-
-# INFERENCE_RAM + VRAM_PER_TASK: informa ao marker quanto de VRAM está disponível.
-os.environ.setdefault("INFERENCE_RAM", os.getenv("MARKER_INFERENCE_RAM_DEFAULT", "16"))
-os.environ.setdefault("VRAM_PER_TASK", os.getenv("MARKER_VRAM_PER_TASK_DEFAULT", "16"))
-
-# ROCm/RDNA3: monkey-patch MODEL_DTYPE bfloat16→float16 na inicialização do módulo.
-# bfloat16 em RDNA3 gera workspace float32 em operações MIOpen, duplicando o uso de VRAM.
-# Deve rodar ANTES de qualquer importação do marker/surya.
-def _patch_marker_dtype_for_rocm() -> None:
-    try:
-        import torch as _t
-        if not getattr(_t.version, "hip", None):
-            return  # só aplica em ROCm
-        from marker.settings import settings as _ms  # type: ignore
-        type(_ms).MODEL_DTYPE = property(lambda self: _t.float16)
-        logging.getLogger("lobeira.parser").info(
-            "marker: MODEL_DTYPE monkey-patched bfloat16→float16 (ROCm/RDNA3 workaround)"
-        )
-    except Exception as _e:
-        logging.getLogger("lobeira.parser").warning(
-            "marker: falha no patch MODEL_DTYPE: %s", _e
-        )
-
-_patch_marker_dtype_for_rocm()
-
-# Precision-first knobs (safe defaults for quality)
-FORCE_OCR_IF_SCORE_BELOW = float(os.getenv("FORCE_OCR_IF_SCORE_BELOW", "0.82" if PARSER_MODE == "precision_first" else "0.65"))
-REPROCESS_IF_SCORE_BELOW = float(os.getenv("REPROCESS_IF_SCORE_BELOW", "0.72" if PARSER_MODE == "precision_first" else "0.55"))
-MIN_CHARS_PER_PAGE_NATIVE = int(os.getenv("MIN_CHARS_PER_PAGE_NATIVE", "180" if PARSER_MODE == "precision_first" else "80"))
+# Fallback chain thresholds:
+# 1. pymupdf  → se score >= 0.9, pronto
+# 2. docling  → se pymupdf < 0.9, tenta; se score >= 0.9, pronto
+# 3. mineru   → se docling < 0.9, tenta; se score >= 0.82, pronto
+# 4. tesseract → se mineru falhar ou score < 0.82
+PYMUPDF_QUALITY_THRESHOLD = float(os.getenv("PYMUPDF_QUALITY_THRESHOLD", "0.9"))
+DOCLING_QUALITY_THRESHOLD = float(os.getenv("DOCLING_QUALITY_THRESHOLD", "0.9"))
+MINERU_QUALITY_THRESHOLD = float(os.getenv("MINERU_QUALITY_THRESHOLD", "0.82"))
+MIN_CHARS_PER_PAGE_NATIVE = int(os.getenv("MIN_CHARS_PER_PAGE_NATIVE", "80"))
 CLEAN_OCR_NOISE = os.getenv("CLEAN_OCR_NOISE", "true").lower() == "true"
 
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
-logger = logging.getLogger("parser-monstro")
+logger = logging.getLogger("lobeira")
 
 SYSTEM_LOG_HISTORY_LIMIT = int(os.getenv("SYSTEM_LOG_HISTORY_LIMIT", "500"))
 SYSTEM_LOG_FILE_PATH = os.getenv("PARSER_SYSTEM_LOG_PATH", "").strip()
@@ -162,124 +94,8 @@ def _ensure_system_log_capture_handler() -> None:
 
 _ensure_system_log_capture_handler()
 
-# ---------------------------------------------------------------------------
-# Marker global model cache (evita recarregar modelos a cada chamada)
-# ---------------------------------------------------------------------------
-_marker_models = None
-_marker_models_lock = None  # inicializado em _get_marker_models para evitar import no topo
 _docling_converter = None
 _docling_converter_lock = None
-_gpu_stage_lock = threading.Lock()
-EASYOCR_DISABLED_REASON = "temporariamente desabilitado em ROCm por instabilidade/meta-tensor"
-
-
-
-
-def _torch_runtime_snapshot() -> Dict[str, Any]:
-    try:
-        import torch
-    except Exception as exc:
-        return {"torch_available": False, "error": str(exc)}
-
-    snapshot: Dict[str, Any] = {
-        "torch_available": True,
-        "cuda_available": bool(getattr(torch.cuda, "is_available", lambda: False)()),
-        "torch_version": getattr(torch, "__version__", None),
-        "cuda_version": getattr(torch.version, "cuda", None),
-        "hip_version": getattr(torch.version, "hip", None),
-        "torch_device_env": os.environ.get("TORCH_DEVICE"),
-        "alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
-        "hipblas_workspace_config": os.environ.get("HIPBLAS_WORKSPACE_CONFIG"),
-    }
-    if snapshot["cuda_available"]:
-        try:
-            idx = torch.cuda.current_device()
-            snapshot.update({
-                "device_index": idx,
-                "device_name": torch.cuda.get_device_name(idx),
-                "memory_allocated_mb": round(torch.cuda.memory_allocated(idx) / (1024 * 1024), 2),
-                "memory_reserved_mb": round(torch.cuda.memory_reserved(idx) / (1024 * 1024), 2),
-                "max_memory_allocated_mb": round(torch.cuda.max_memory_allocated(idx) / (1024 * 1024), 2),
-                "max_memory_reserved_mb": round(torch.cuda.max_memory_reserved(idx) / (1024 * 1024), 2),
-            })
-        except Exception as exc:
-            snapshot["device_error"] = str(exc)
-    return snapshot
-
-
-def _log_torch_runtime(label: str, logs: Optional[List[str]] = None) -> None:
-    snap = _torch_runtime_snapshot()
-    msg = f"{label}: torch={json.dumps(snap, ensure_ascii=False, sort_keys=True)}"
-    logger.info(msg)
-    if logs is not None:
-        logs.append(msg)
-
-
-def _marker_runtime_settings() -> Dict[str, Optional[str]]:
-    base = {
-        "torch_device": os.environ.get("TORCH_DEVICE"),
-        "recognition_batch_size": os.environ.get("RECOGNITION_BATCH_SIZE"),
-        "detector_batch_size": os.environ.get("DETECTOR_BATCH_SIZE"),
-        "layout_batch_size": os.environ.get("LAYOUT_BATCH_SIZE"),
-        "table_rec_batch_size": os.environ.get("TABLE_REC_BATCH_SIZE"),
-        "order_batch_size": os.environ.get("ORDER_BATCH_SIZE"),
-        "batch_multiplier": os.environ.get("BATCH_MULTIPLIER"),
-        "inference_ram": os.environ.get("INFERENCE_RAM"),
-        "vram_per_task": os.environ.get("VRAM_PER_TASK"),
-        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
-        "hipblas_workspace_config": os.environ.get("HIPBLAS_WORKSPACE_CONFIG"),
-        "miopen_find_mode": os.environ.get("MIOPEN_FIND_MODE"),
-        "torch_blas_prefer_hipblaslt": os.environ.get("TORCH_BLAS_PREFER_HIPBLASLT"),
-        "pytorch_no_cuda_memory_caching": os.environ.get("PYTORCH_NO_CUDA_MEMORY_CACHING"),
-        "model_cache_dir": os.environ.get("MODEL_CACHE_DIR"),
-    }
-    # loga os valores efetivos do surya para confirmar que chegaram
-    try:
-        from surya.settings import settings as _surya  # type: ignore
-        base["surya_detector_batch"] = str(getattr(_surya, "DETECTOR_BATCH_SIZE", "N/A"))
-        base["surya_recognition_batch"] = str(getattr(_surya, "RECOGNITION_BATCH_SIZE", "N/A"))
-        base["surya_layout_batch"] = str(getattr(_surya, "LAYOUT_BATCH_SIZE", "N/A"))
-        base["surya_order_batch"] = str(getattr(_surya, "ORDER_BATCH_SIZE", "N/A"))
-        base["surya_table_rec_batch"] = str(getattr(_surya, "TABLE_REC_BATCH_SIZE", "N/A"))
-    except Exception:
-        pass
-    return base
-
-
-def _log_marker_runtime_settings(logs: Optional[List[str]] = None) -> None:
-    settings = _marker_runtime_settings()
-    msg = f"marker:settings={json.dumps(settings, ensure_ascii=False, sort_keys=True)}"
-    logger.info(msg)
-    if logs is not None:
-        logs.append(msg)
-
-
-def _torch_empty_cache(logs: Optional[List[str]] = None, reason: Optional[str] = None) -> None:
-    try:
-        import torch
-        if getattr(torch.cuda, "is_available", lambda: False)():
-            gc.collect()
-            if hasattr(torch.cuda, "synchronize"):
-                try:
-                    torch.cuda.synchronize()
-                except Exception as sync_exc:
-                    logger.debug("Falha ao sincronizar torch antes de empty_cache: %s", sync_exc)
-            torch.cuda.empty_cache()
-            suffix = f" ({reason})" if reason else ""
-            detail = f"gc.collect() + torch.cuda.empty_cache() executado{suffix}"
-            logger.info(detail)
-            if logs is not None:
-                logs.append(detail)
-    except Exception as exc:
-        logger.debug("Falha ao limpar cache torch: %s", exc)
-        if logs is not None:
-            logs.append(f"torch cache cleanup falhou: {exc}")
-
-
-def _effective_easyocr_enabled(requested: bool) -> bool:
-    if requested:
-        logger.warning("EasyOCR solicitado, mas ignorado: %s", EASYOCR_DISABLED_REASON)
-    return False
 
 
 def _get_docling_converter():
@@ -298,111 +114,18 @@ def _get_docling_converter():
             pipeline_options = PdfPipelineOptions()
             pipeline_options.do_ocr = False
 
-            # Forçar CPU para docling — mantém VRAM livre para o marker.
-            # Sem perda de qualidade: os pesos são os mesmos; só a latência aumenta levemente.
-            # Permite sobrescrever via env DOCLING_DEVICE=cuda se necessário.
-            docling_device = os.environ.get("DOCLING_DEVICE", "cpu")
-            if docling_device == "cpu":
-                try:
-                    from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice  # type: ignore
-                    pipeline_options.accelerator_options = AcceleratorOptions(
-                        num_threads=4, device=AcceleratorDevice.CPU
-                    )
-                    logger.info("docling: forçado para CPU (DOCLING_DEVICE=cpu)")
-                except Exception as _acc_err:
-                    # fallback: seta env var pra garantir que torch não use GPU no contexto do docling
-                    logger.warning("docling: AcceleratorOptions indisponível (%s) — usando TORCH_DEVICE fallback", _acc_err)
-                    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+            try:
+                from docling.datamodel.pipeline_options import AcceleratorOptions, AcceleratorDevice  # type: ignore
+                pipeline_options.accelerator_options = AcceleratorOptions(
+                    num_threads=4, device=AcceleratorDevice.CPU
+                )
+            except Exception as _acc_err:
+                logger.debug("docling: AcceleratorOptions indisponível: %s", _acc_err)
 
             _docling_converter = DocumentConverter(
                 format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
             )
     return _docling_converter
-
-
-def _get_marker_models():
-    """Retorna (e inicializa se necessário) o dict de modelos Marker/Surya.
-
-    Thread-safe: múltiplos workers podem chamar em paralelo.
-    Os modelos ficam em memória entre requisições para evitar reload.
-    """
-    global _marker_models, _marker_models_lock
-    import threading as _threading
-    import torch
-
-    if _marker_models_lock is None:
-        _marker_models_lock = _threading.Lock()
-
-    with _marker_models_lock:
-        if _marker_models is None:
-            from marker.models import create_model_dict  # type: ignore
-            torch_device_env = os.environ.get("TORCH_DEVICE")
-            if torch_device_env:
-                device = torch_device_env
-            else:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-            logger.info(
-                "Inicializando Marker/Surya com device=%s "
-                "(torch.cuda.is_available=%s, torch.version.cuda=%s, torch.version.hip=%s, TORCH_DEVICE_ENV=%s)",
-                device,
-                torch.cuda.is_available(),
-                getattr(torch.version, "cuda", "N/A"),
-                getattr(torch.version, "hip", "N/A"),
-                torch_device_env or "<não definido>",
-            )
-
-            # ROCm/RDNA3: bfloat16 tem bugs severos — operações MIOpen geram workspace em float32,
-            # duplicando o uso de VRAM (~10 GB observado vs ~5 GB documentado).
-            # Forçar float16 que tem suporte nativo robusto no RDNA3.
-            # Marker v2 usa settings.MODEL_DTYPE como propriedade computada para carregar modelos.
-            _dtype_patched = False
-            if device == "cuda" and getattr(torch.version, "hip", None):
-                try:
-                    from marker.settings import settings as _marker_settings  # type: ignore
-                    _orig_dtype_prop = type(_marker_settings).__dict__.get("MODEL_DTYPE")
-                    type(_marker_settings).MODEL_DTYPE = property(lambda self: torch.float16)
-                    _dtype_patched = True
-                    logger.info("marker: MODEL_DTYPE monkey-patched bfloat16 → float16 (ROCm/RDNA3 workaround)")
-                except Exception as _patch_err:
-                    logger.warning("marker: falha ao aplicar patch MODEL_DTYPE: %s", _patch_err)
-
-            # Verifica o dtype efetivo após patch — loga pra aparecer nos job logs
-            try:
-                from marker.settings import settings as _ms_check  # type: ignore
-                _effective_dtype = str(getattr(_ms_check, 'MODEL_DTYPE', 'unknown'))
-                logger.info("marker: MODEL_DTYPE efetivo antes do load = %s", _effective_dtype)
-            except Exception as _de:
-                logger.info("marker: não foi possível verificar MODEL_DTYPE: %s", _de)
-
-            _log_marker_runtime_settings()
-            _log_torch_runtime("marker:init:before-load")
-            _marker_models = create_model_dict(device=device)
-            if _dtype_patched:
-                logger.info("marker: modelos carregados com float16 patch ativo")
-            _log_torch_runtime("marker:init:after-load")
-    return _marker_models
-
-
-def _preload_marker():
-    """Pré-carrega modelos Marker em background thread para evitar delay na primeira inferência."""
-    import torch
-    try:
-        logger.info(
-            "Pré-carregando modelos Marker/Surya (MODEL_CACHE_DIR=%s) | "
-            "torch.cuda.is_available()=%s | torch.version.cuda=%s | torch.version.hip=%s",
-            MARKER_MODEL_DIR,
-            torch.cuda.is_available(),
-            getattr(torch.version, "cuda", "N/A"),
-            getattr(torch.version, "hip", "N/A"),
-        )
-        with _gpu_stage_lock:
-            _log_marker_runtime_settings()
-            _log_torch_runtime("marker:preload:before")
-            _get_marker_models()
-            _log_torch_runtime("marker:preload:after")
-        logger.info("Modelos Marker carregados com sucesso.")
-    except Exception as e:
-        logger.warning("Falha ao pré-carregar Marker: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +376,6 @@ class DocumentInput(BaseModel):
 
 
 class ParseOptions(BaseModel):
-    enable_easyocr: bool = False
     force_ocr: bool = False
 
 
@@ -727,15 +449,7 @@ class EnrichmentResult(BaseModel):
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Parser Monstro", version="1.0.0")
-
-
-EASYOCR_MODEL_DIR = str(STORAGE_ROOT / "easyocr_models")
-
-
-def _preload_easyocr():
-    """EasyOCR está desabilitado temporariamente em ROCm por instabilidade."""
-    logger.warning("Pré-carregamento EasyOCR ignorado: %s", EASYOCR_DISABLED_REASON)
+app = FastAPI(title="Lobeira", version="2.0.0")
 
 
 @app.on_event("startup")
@@ -743,23 +457,17 @@ async def startup():
     global semaphore
     semaphore = asyncio.Semaphore(MAX_WORKERS)
     STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
-    Path(EASYOCR_MODEL_DIR).mkdir(parents=True, exist_ok=True)
     _init_job_store()
     await _restore_and_schedule_purges()
     logger.info(
-        "Parser Monstro iniciado. mode=%s MAX_WORKERS=%d EASYOCR=%s OCR<%.2f REPROCESS<%.2f",
+        "Lobeira iniciado. mode=%s MAX_WORKERS=%d "
+        "thresholds: pymupdf=%.2f docling=%.2f mineru=%.2f",
         PARSER_MODE,
         MAX_WORKERS,
-        False,
-        FORCE_OCR_IF_SCORE_BELOW,
-        REPROCESS_IF_SCORE_BELOW,
+        PYMUPDF_QUALITY_THRESHOLD,
+        DOCLING_QUALITY_THRESHOLD,
+        MINERU_QUALITY_THRESHOLD,
     )
-    _log_torch_runtime("startup")
-    Path(MARKER_MODEL_DIR).mkdir(parents=True, exist_ok=True)
-    # preload removido para evitar reset da GPU no WSL
-    # threading.Thread(target=_preload_marker, daemon=True, name="marker-preload").start()
-    if ENABLE_EASYOCR:
-        logger.warning("ENABLE_EASYOCR=true ignorado: %s", EASYOCR_DISABLED_REASON)
 
 
 _init_job_store()
@@ -780,11 +488,12 @@ def health():
     return {
         "status": "ok",
         "tesseract": tess_ok,
-        "easyocr_enabled": False,
-        "easyocr_disabled_reason": EASYOCR_DISABLED_REASON,
         "parser_mode": PARSER_MODE,
-        "force_ocr_if_score_below": FORCE_OCR_IF_SCORE_BELOW,
-        "reprocess_if_score_below": REPROCESS_IF_SCORE_BELOW,
+        "thresholds": {
+            "pymupdf": PYMUPDF_QUALITY_THRESHOLD,
+            "docling": DOCLING_QUALITY_THRESHOLD,
+            "mineru": MINERU_QUALITY_THRESHOLD,
+        },
         "max_workers": queue["max_workers"],
         "slots_in_use": queue["slots_in_use"],
         "slots_free": queue["slots_free"],
@@ -1271,7 +980,7 @@ def _process_job_sync(job_id: str, req: ParseRequest, documents: List[DocumentIn
     t0 = time.time()
     doc_results: List[Dict[str, Any]] = []
     errors: List[str] = []
-    use_easyocr = _effective_easyocr_enabled((req.options and req.options.enable_easyocr) or ENABLE_EASYOCR)
+    use_easyocr = False  # EasyOCR removido — não utilizado
     force_ocr = bool(req.options and req.options.force_ocr)
     target_dir = STORAGE_ROOT / req.tender_id
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1363,7 +1072,8 @@ def _process_job_sync(job_id: str, req: ParseRequest, documents: List[DocumentIn
 
 
 async def _handle_document(doc: DocumentInput, tmpdir: Path, use_easyocr: bool, force_ocr: bool) -> List[Dict]:
-    """Download + decompress + parse one document. Returns list of DocumentResult dicts."""
+    """Download + decompress + parse one document. Returns list of DocumentResult dicts.
+    use_easyocr mantido por compatibilidade de assinatura; sem efeito."""
     safe_name = Path(doc.filename).name or f"doc_{uuid.uuid4().hex}"
     dest = tmpdir / safe_name
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -1531,238 +1241,176 @@ def _parse_file(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
         text = path.read_text(errors="replace")
         return _make_result(filename, "plain_text", "read", 1, 1.0, text)
     elif mime.startswith("image/"):
-        return _parse_image_ocr(path, use_easyocr)
+        return _parse_image_ocr(path)
     else:
         return _make_result(filename, mime, "unsupported", 0, 0.0, "", error=f"Tipo não suportado: {mime}")
 
 
 def _parse_pdf(path: Path, use_easyocr: bool, force_ocr: bool) -> Dict:
-    global _docling_converter, _marker_models
+    """Fallback chain: pymupdf → docling → mineru → tesseract.
+
+    Cada etapa só roda se a anterior ficou abaixo do threshold de qualidade:
+    - pymupdf  >= PYMUPDF_QUALITY_THRESHOLD  (0.9) → pronto
+    - docling  >= DOCLING_QUALITY_THRESHOLD  (0.9) → pronto
+    - mineru   >= MINERU_QUALITY_THRESHOLD   (0.82) → pronto
+    - tesseract → último recurso
+    """
     filename = path.name
     text = ""
     method = ""
     pages = 0
+    quality = 0.0
     logs: List[str] = []
 
+    # ------------------------------------------------------------------
+    # Step 1: pymupdf
+    # ------------------------------------------------------------------
     try:
         import fitz
         doc = fitz.open(str(path))
         pages = doc.page_count
         parts = [(doc.load_page(i).get_text("text") or "") for i in range(pages)]
         doc.close()
-        text = "\n".join(parts).strip()
+        raw = "\n".join(parts).strip()
+        text = _normalize_text(raw)
         if text:
             method = "pymupdf"
+            quality = _quality_score(text, pages)
+            chars_per_page = len(text) / max(1, pages)
+            if chars_per_page < MIN_CHARS_PER_PAGE_NATIVE:
+                # texto existe mas escasso — tratar como fraco independente do score
+                quality = min(quality, PYMUPDF_QUALITY_THRESHOLD - 0.01)
+            logs.append(f"pymupdf: {len(text)} chars, {pages}p, score={quality:.2f}")
+        else:
+            logs.append("pymupdf: sem texto nativo")
     except Exception as e:
-        logger.debug("pymupdf falhou em %s: %s", filename, e)
         logs.append(f"pymupdf: falhou ({e})")
 
-    text = _normalize_text(text)
-    quality = _quality_score(text, pages)
-    chars_per_page = (len(text) / max(1, pages)) if text else 0
-    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW or chars_per_page < MIN_CHARS_PER_PAGE_NATIVE
+    if not force_ocr and quality >= PYMUPDF_QUALITY_THRESHOLD:
+        logs.append(f"pymupdf: suficiente (score={quality:.2f} >= {PYMUPDF_QUALITY_THRESHOLD}), parando chain")
+        return _make_result(filename, "pdf_native", method, pages, quality, text, logs=logs)
 
-    if method == "pymupdf":
-        if native_is_weak:
-            logs.append(
-                f"pymupdf: extraiu {len(text)} chars, {pages}p (score {quality:.2f} — fraco, tentando fallback)"
-            )
+    # ------------------------------------------------------------------
+    # Step 2: docling
+    # ------------------------------------------------------------------
+    try:
+        from docling.document_converter import DocumentConverter  # type: ignore
+        converter = _get_docling_converter()
+        result = converter.convert(str(path))
+        docling_raw = result.document.export_to_text() if result and result.document else ""
+        del result
+        docling_text = _normalize_text(docling_raw)
+        if docling_text:
+            docling_pages = pages or 1
+            docling_quality = _quality_score(docling_text, docling_pages)
+            logs.append(f"docling: {len(docling_text)} chars, {docling_pages}p, score={docling_quality:.2f}")
+            if docling_quality > quality:
+                text = docling_text
+                pages = docling_pages
+                quality = docling_quality
+                method = "docling"
         else:
-            logs.append(f"pymupdf: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
-    elif not logs:
-        logs.append("pymupdf: extraiu 0 chars (sem texto nativo)")
+            logs.append("docling: resultado vazio")
+    except ImportError:
+        logs.append("docling: não instalado — pulado")
+    except Exception as e:
+        logs.append(f"docling: falhou ({str(e)[:200]})")
 
-    if not text or native_is_weak or force_ocr:
-        _docling_available = False
-        try:
-            from docling.document_converter import DocumentConverter  # type: ignore
-            _docling_available = True
-        except ImportError:
-            logger.warning("docling não instalado — pulando etapa 2 do fallback para %s", filename)
-            logs.append("docling: não instalado — pulado")
-        if _docling_available:
-            try:
-                with _gpu_stage_lock:
-                    _torch_empty_cache(logs, "antes do docling")
-                    _log_torch_runtime("docling:before", logs)
-                    converter = _get_docling_converter()
-                    result = converter.convert(str(path))
-                    _log_torch_runtime("docling:after", logs)
-                docling_text = result.document.export_to_text() if result and result.document else ""
-                del result
-                _torch_empty_cache(logs, "após docling")
-                docling_text = _normalize_text(docling_text)
-                if docling_text:
-                    docling_pages = pages or 1
-                    docling_quality = _quality_score(docling_text, docling_pages)
-                    if force_ocr or docling_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                        text = docling_text
-                        pages = docling_pages
-                        quality = docling_quality
-                        method = "docling"
-                        native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-                        logs.append(
-                            f"docling: extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
-                        )
-                    else:
-                        logs.append(
-                            f"docling: não melhorou resultado"
-                            f" (score {docling_quality:.2f} vs {quality:.2f})"
-                        )
-                else:
-                    logs.append("docling: resultado vazio (PDF scaneado sem texto extraível)")
-            except Exception as e:
-                logger.warning("docling falhou em %s: %s", filename, e)
-                logs.append(f"docling: falhou ({e})")
-            finally:
-                # Descarrega explicitamente o conversor docling para liberar VRAM antes do marker
-                _docling_converter = None
-                _torch_empty_cache(logs, "após docling (unload)")
+    if not force_ocr and quality >= DOCLING_QUALITY_THRESHOLD:
+        logs.append(f"docling: suficiente (score={quality:.2f} >= {DOCLING_QUALITY_THRESHOLD}), parando chain")
+        return _make_result(filename, "pdf_native", method, pages, quality, text, logs=logs)
 
-    # MinerU entra se ainda não temos texto de qualidade após pymupdf + docling.
-    _mineru_needed = force_ocr or not text or native_is_weak
-    if _mineru_needed:
-        logs.append(f"mineru: tentando (score atual {quality:.2f}, fraco={native_is_weak})")
-    else:
-        logs.append(f"mineru: pulado — resultado já suficiente (score {quality:.2f}, método={method})")
+    # ------------------------------------------------------------------
+    # Step 3: MinerU
+    # ------------------------------------------------------------------
+    logs.append(f"mineru: tentando (score atual={quality:.2f})")
+    try:
+        import tempfile
+        import subprocess as _sp
+        with tempfile.TemporaryDirectory() as _tmpdir:
+            _out_dir = Path(_tmpdir) / "out"
+            _out_dir.mkdir()
+            _cmd = [
+                "mineru",
+                "-p", str(path),
+                "-o", str(_out_dir),
+                "--method", "pipeline",
+                "--lang", "pt",
+            ]
+            _result = _sp.run(
+                _cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if _result.returncode != 0:
+                raise RuntimeError(f"returncode={_result.returncode}: {_result.stderr[:400]}")
+            _md_files = list(_out_dir.rglob("*.md"))
+            _mineru_raw = "\n".join(f.read_text(errors="replace") for f in _md_files)
 
-    if _mineru_needed:
-        try:
-            import torch as _torch_check
-            if getattr(_torch_check.cuda, "is_available", lambda: False)():
-                _torch_check.cuda.reset_peak_memory_stats()
-        except Exception:
-            pass
+        mineru_text = _normalize_text(_mineru_raw.strip())
+        if mineru_text:
+            mineru_pages = pages or 1
+            mineru_quality = _quality_score(mineru_text, mineru_pages)
+            logs.append(f"mineru: {len(mineru_text)} chars, {mineru_pages}p, score={mineru_quality:.2f}")
+            if mineru_quality > quality:
+                text = mineru_text
+                pages = mineru_pages
+                quality = mineru_quality
+                method = "mineru"
+        else:
+            logs.append("mineru: resultado vazio")
+    except FileNotFoundError:
+        logs.append("mineru: não instalado — pulado")
+    except Exception as e:
+        logs.append(f"mineru: falhou ({str(e)[:300]})")
 
-        try:
-            import tempfile, subprocess as _sp, json as _json
-            from pathlib import Path as _Path
+    if not force_ocr and quality >= MINERU_QUALITY_THRESHOLD:
+        logs.append(f"mineru: suficiente (score={quality:.2f} >= {MINERU_QUALITY_THRESHOLD}), parando chain")
+        type_detected = "pdf_native" if method in ("pymupdf", "docling", "mineru") else "pdf_scanned"
+        return _make_result(filename, type_detected, method, pages, quality, text, logs=logs)
 
-            _log_torch_runtime("mineru:before", logs)
-
-            with tempfile.TemporaryDirectory() as _tmpdir:
-                _out_dir = _Path(_tmpdir) / "out"
-                _out_dir.mkdir()
-                _cmd = [
-                    "mineru",
-                    "-p", str(path),
-                    "-o", str(_out_dir),
-                    "--method", "pipeline",
-                    "--lang", "pt",
-                ]
-                _env = {**os.environ}
-                _result = _sp.run(
-                    _cmd,
-                    env=_env,
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                )
-                if _result.returncode != 0:
-                    raise RuntimeError(f"mineru returncode={_result.returncode}: {_result.stderr[:500]}")
-
-                # MinerU gera <nome_arquivo>/<nome_arquivo>.md
-                _md_files = list(_out_dir.rglob("*.md"))
-                _mineru_text = ""
-                for _md in _md_files:
-                    _mineru_text += _md.read_text(errors="replace") + "\n"
-
-            _log_torch_runtime("mineru:after", logs)
-
-            mineru_text = _normalize_text(_mineru_text.strip())
-            if mineru_text:
-                mineru_pages = pages or 1
-                mineru_quality = _quality_score(mineru_text, mineru_pages)
-                if force_ocr or mineru_quality > quality or quality < REPROCESS_IF_SCORE_BELOW:
-                    text = mineru_text
-                    pages = mineru_pages
-                    quality = mineru_quality
-                    method = "mineru"
-                    native_is_weak = quality < FORCE_OCR_IF_SCORE_BELOW
-                    logs.append(f"mineru: extraiu {len(text)} chars, {pages}p (score {quality:.2f})")
-                else:
-                    logs.append(f"mineru: não melhorou resultado (score {mineru_quality:.2f} vs {quality:.2f})")
-            else:
-                logs.append("mineru: resultado vazio")
-        except FileNotFoundError:
-            logger.warning("mineru não instalado — pulando para %s", filename)
-            logs.append("mineru: não instalado — pulado")
-        except Exception as e:
-            _torch_empty_cache(logs, "falha do mineru")
-            _log_torch_runtime("mineru:failure", logs)
-            logger.warning("mineru falhou em %s: %s", filename, e)
-            logs.append(f"mineru: falhou ({str(e)[:300]})")
-
-    if not text or native_is_weak or force_ocr:
-        try:
-            text_ocr, pages_ocr, ocr_engine = _pdf_ocr_tesseract(path, use_easyocr)
-            ocr_text = _normalize_text(text_ocr)
-            if ocr_text:
-                ocr_pages = pages_ocr or max(1, pages)
-                ocr_quality = _quality_score(ocr_text, ocr_pages)
-                if force_ocr or not text or ocr_quality >= quality:
-                    text = ocr_text
-                    pages = ocr_pages
-                    quality = ocr_quality
-                    method = "ocr"
-                    logs.append(
-                        f"ocr ({ocr_engine}): extraiu {len(text)} chars, {pages}p (score {quality:.2f})"
-                    )
-                else:
-                    logs.append(f"ocr ({ocr_engine}): não melhorou resultado (score {ocr_quality:.2f} vs {quality:.2f})")
-            else:
-                logs.append("ocr: resultado vazio")
-        except Exception as e:
-            logger.warning("ocr falhou em %s: %s", filename, e)
-            logs.append(f"ocr: falhou ({e})")
+    # ------------------------------------------------------------------
+    # Step 4: Tesseract (último recurso)
+    # ------------------------------------------------------------------
+    logs.append(f"tesseract: tentando (score atual={quality:.2f})")
+    try:
+        text_ocr, pages_ocr, _ = _pdf_ocr_tesseract(path)
+        ocr_text = _normalize_text(text_ocr)
+        if ocr_text:
+            ocr_pages = pages_ocr or max(1, pages)
+            ocr_quality = _quality_score(ocr_text, ocr_pages)
+            logs.append(f"tesseract: {len(ocr_text)} chars, {ocr_pages}p, score={ocr_quality:.2f}")
+            if force_ocr or not text or ocr_quality >= quality:
+                text = ocr_text
+                pages = ocr_pages
+                quality = ocr_quality
+                method = "tesseract"
+        else:
+            logs.append("tesseract: resultado vazio")
+    except Exception as e:
+        logs.append(f"tesseract: falhou ({e})")
 
     type_detected = "pdf_native" if method in ("pymupdf", "docling", "mineru") else "pdf_scanned"
     return _make_result(filename, type_detected, method or "failed", pages, quality, text, logs=logs)
 
 
-def _pdf_ocr_tesseract(path: Path, use_easyocr: bool) -> tuple:
-    use_easyocr = _effective_easyocr_enabled(use_easyocr)
+def _pdf_ocr_tesseract(path: Path) -> tuple:
+    """Converte PDF para imagens e extrai texto via Tesseract."""
     import pytesseract
     from PIL import Image
-    try:
-        from pdf2image import convert_from_path
-        images = convert_from_path(str(path), dpi=200)
-    except Exception:
-        import fitz
-        doc = fitz.open(str(path))
-        images = []
-        for i in range(doc.page_count):
-            pix = doc.load_page(i).get_pixmap(dpi=200)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            images.append(img)
-        doc.close()
+    import fitz
 
-    easyocr_reader = None
-    if use_easyocr:
-        try:
-            import easyocr
-            import numpy as np
-            try:
-                easyocr_reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
-            except Exception:
-                easyocr_reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
-        except Exception as _ocr_init_err:
-            logger.warning("easyocr init falhou, usando tesseract: %s", _ocr_init_err)
+    doc = fitz.open(str(path))
+    images = []
+    for i in range(doc.page_count):
+        pix = doc.load_page(i).get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
+    doc.close()
 
-    parts = []
-    for img in images:
-        if easyocr_reader is not None:
-            try:
-                result = easyocr_reader.readtext(np.array(img))
-                parts.append(" ".join(r[1] for r in result))
-                continue
-            except Exception:
-                pass
-        t = pytesseract.image_to_string(img, lang="por+eng")
-        parts.append(t)
-
-    engine_used = "easyocr" if easyocr_reader is not None else "tesseract"
-    return "\n".join(parts).strip(), len(images), engine_used
+    parts = [pytesseract.image_to_string(img, lang="por+eng") for img in images]
+    return "\n".join(parts).strip(), len(images), "tesseract"
 
 
 def _parse_docx(path: Path) -> Dict:
@@ -1789,26 +1437,12 @@ def _parse_html(path: Path) -> Dict:
         return _make_result(filename, "html", "failed", 0, 0.0, "", error=str(e))
 
 
-def _parse_image_ocr(path: Path, use_easyocr: bool) -> Dict:
-    use_easyocr = _effective_easyocr_enabled(use_easyocr)
+def _parse_image_ocr(path: Path) -> Dict:
     filename = path.name
     try:
         from PIL import Image
         import pytesseract
         img = Image.open(str(path))
-        if use_easyocr:
-            try:
-                import easyocr
-                import numpy as np
-                try:
-                    reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=True)
-                except Exception:
-                    reader = easyocr.Reader(["pt", "en"], model_storage_directory=EASYOCR_MODEL_DIR, gpu=False)
-                result = reader.readtext(np.array(img))
-                text = " ".join(r[1] for r in result)
-                return _make_result(filename, "image", "easyocr", 1, _quality_score(text, 1), text)
-            except Exception:
-                pass
         text = pytesseract.image_to_string(img, lang="por+eng")
         return _make_result(filename, "image", "tesseract", 1, _quality_score(text, 1), text)
     except Exception as e:
